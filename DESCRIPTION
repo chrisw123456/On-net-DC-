@@ -1,0 +1,23 @@
+Package: OnNetModelingShinylive
+Type: Project
+Title: On-Net Data Center Modeling Shinylive App
+Version: 5.4.0.9000
+Authors@R: person("Christopher", "Wang", role = c("aut", "cre"))
+Description: Static Shinylive deployment project for the On-Net Data Center Modeling application. The modeling workbook is supplied by the user at runtime and is not included in the published site.
+License: file LICENSE
+Encoding: UTF-8
+Depends:
+    R (>= 4.1)
+Imports:
+    shiny,
+    DT,
+    readxl,
+    dplyr,
+    tidyr,
+    readr,
+    tibble,
+    ggplot2,
+    scales
+Suggests:
+    shinylive,
+    httpuv

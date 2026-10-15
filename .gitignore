@@ -1,0 +1,13 @@
+site/
+__pycache__/
+*.pyc
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.csv
+!tests/fixtures/*.csv
