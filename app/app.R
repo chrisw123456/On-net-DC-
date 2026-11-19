@@ -1,4 +1,6 @@
 # On-Net Data Center Characteristics, Customer Data and Model
+# Version 17.11-ridge — Shinylive/browser-compatible ridge model replaces the prior boosted-tree model while retaining
+#             the same target, predictors, training-set option, CV metrics, model explanation, and rankings.
 # Version 17.11 — model training set option: all eligible GLMs (default) or only GLMs first billed in/after a
 #             cutoff year (dc_bill_date, default 2019). Applied on Load workbook. Matching pool, class limits and
 #             portfolio tables stay on all eligible GLMs.
@@ -45,7 +47,7 @@
 # Version 5.8 — one comparison group: matched sites classified High / Medium / Low among themselves;
 #             Overview order Comparable -> Projected -> Outlier-Adjusted Benchmark.
 # Version 5.7.3 — Performer Classification section, peer-median explainer and peer drill-down.
-# Version 5.7.2 — CAPEX removed from the XGBoost model inputs (financials only).
+# Version 5.7.2 — CAPEX removed from the predictive model inputs (financials only).
 # Version 5.7 — High / Medium / Low performer classification (outliers vs segment, market, size,
 #               power and on-net date peers); revenue averages use Medium performers only.
 # Version 5.6 — performance "vs peers" replaces model-expected revenue; model similarity and
@@ -59,7 +61,7 @@
 
 required_packages <- c(
   "shiny", "DT", "readxl", "dplyr", "tidyr", "readr", "tibble",
-  "ggplot2", "scales", "xgboost"
+  "ggplot2", "scales"
 )
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
@@ -121,11 +123,10 @@ optional_columns <- c(
   "CAPEX"  # optional: only used for the historical 4MC financials, never for matching or the model
 )
 
-xgb_parameters <- list(
-  objective = "reg:squarederror", eval_metric = "rmse", eta = 0.03,
-  max_depth = 5, min_child_weight = 5, subsample = 0.80,
-  colsample_bytree = 0.80
-)
+# Ridge penalty candidates. The model minimizes mean squared log-revenue error plus
+# lambda times the squared standardized coefficients. Positive penalties keep the
+# linear solve stable in browser/WebAssembly sessions, including wide one-hot matrices.
+ridge_lambda_grid <- 10 ^ seq(-4, 2, length.out = 13)
 
 # Static 4MC assumptions
 projection_years <- 2026:2035
@@ -502,65 +503,115 @@ encode_features <- function(df, encoder) {
   x
 }
 
+ridge_standardize <- function(model, x) {
+  x <- as.matrix(x)
+  if (ncol(x) != length(model$center)) stop("Ridge feature matrix has an unexpected number of columns.")
+  sweep(sweep(x, 2, model$center, `-`), 2, model$scale, `/`)
+}
+
+ridge_fit <- function(x, y, lambda) {
+  x <- as.matrix(x); y <- as.numeric(y)
+  if (!nrow(x) || nrow(x) != length(y) || !is.finite(lambda) || lambda <= 0)
+    stop("Invalid ridge training data or penalty.")
+  center <- colMeans(x)
+  scale_values <- apply(x, 2, stats::sd)
+  scale_values[!is.finite(scale_values) | scale_values <= sqrt(.Machine$double.eps)] <- 1
+  xs <- sweep(sweep(x, 2, center, `-`), 2, scale_values, `/`)
+  intercept <- mean(y)
+  yc <- y - intercept
+  n <- nrow(xs); p <- ncol(xs)
+  # Use the smaller primal or dual system. This is base R only and therefore webR-friendly.
+  beta <- if (p <= n) {
+    solve(crossprod(xs) / n + diag(lambda, p), crossprod(xs, yc) / n)
+  } else {
+    crossprod(xs, solve(tcrossprod(xs) + diag(n * lambda, n), yc))
+  }
+  beta <- as.numeric(beta)
+  names(beta) <- colnames(x)
+  list(intercept = intercept, beta = beta, center = center, scale = scale_values,
+       lambda = lambda, feature_names = colnames(x))
+}
+
+ridge_predict_log <- function(model, x) {
+  as.numeric(model$intercept + ridge_standardize(model, x) %*% model$beta)
+}
+
+ridge_metrics <- function(actual, predicted) {
+  ok <- is.finite(actual) & is.finite(predicted)
+  actual <- actual[ok]; predicted <- predicted[ok]
+  if (!length(actual)) return(c(RMSE = NA_real_, MAE = NA_real_, R2 = NA_real_))
+  denominator <- sum((actual - mean(actual)) ^ 2)
+  c(RMSE = sqrt(mean((actual - predicted) ^ 2)),
+    MAE = mean(abs(actual - predicted)),
+    R2 = if (denominator > 0) 1 - sum((actual - predicted) ^ 2) / denominator else NA_real_)
+}
+
 train_secondary_model <- function(profile, progress) {
   training <- profile %>% filter(is.finite(Total_MRR_12M), Total_MRR_12M >= minimum_revenue)
   empty <- list(
-    model = NULL, encoder = NULL, eligible_rows = nrow(training), final_nrounds = NA_integer_,
-    model_message = "XGBoost unavailable: insufficient eligible rows or package not installed.",
+    model = NULL, encoder = NULL, eligible_rows = nrow(training), final_lambda = NA_real_,
+    model_message = "Ridge model unavailable: at least 20 eligible training rows are required.",
     historical_scores = tibble(GLM_ID = character(), Actual_Revenue = numeric(), Predicted_Revenue = numeric()),
     test_results = tibble(Actual_Revenue = numeric(), Predicted_Revenue = numeric()),
-    cv_results = tibble(Fold = integer(), RMSE = numeric(), MAE = numeric(), R2 = numeric(), Best_Iteration = integer()),
+    cv_results = tibble(Fold = integer(), RMSE = numeric(), MAE = numeric(), R2 = numeric(), Lambda = numeric()),
     importance_matrix = data.frame(), holdout_rmse = NA_real_, holdout_mae = NA_real_, holdout_r2 = NA_real_
   )
-  if (nrow(training) < 20L || !requireNamespace("xgboost", quietly = TRUE)) return(empty)
+  if (nrow(training) < 20L) return(empty)
   tryCatch({
     encoder <- fit_encoder(training)
     x <- encode_features(training, encoder)
     y <- log1p(training$Total_MRR_12M)
     set.seed(123)
-    train_index <- sample(seq_len(nrow(x)), floor(0.8 * nrow(x)))
-    test_index <- setdiff(seq_len(nrow(x)), train_index)
-    train <- xgboost::xgb.DMatrix(x[train_index, , drop = FALSE], label = y[train_index])
-    test <- xgboost::xgb.DMatrix(x[test_index, , drop = FALSE], label = y[test_index])
-    progress(0.28, "Training secondary all-product historical model")
-    validation_model <- xgboost::xgb.train(params = xgb_parameters, data = train, nrounds = 1000,
-                                           watchlist = list(validation = test), early_stopping_rounds = 50, verbose = 0)
-    predictions <- pmax(expm1(predict(validation_model, test)), 0)
-    actual <- expm1(y[test_index])
-    metrics <- function(a, p) {
-      denominator <- sum((a - mean(a))^2)
-      c(RMSE = sqrt(mean((a - p)^2)), MAE = mean(abs(a - p)),
-        R2 = if (denominator > 0) 1 - sum((a - p)^2) / denominator else NA_real_)
-    }
-    holdout <- metrics(actual, predictions)
-    set.seed(123)
-    folds <- sample(rep(seq_len(5L), length.out = nrow(x)))
+    fold_id <- sample(rep(seq_len(5L), length.out = nrow(x)))
+    lambdas <- ridge_lambda_grid
+    progress(0.28, "Selecting the ridge penalty with 5-fold cross-validation")
+
+    # Build out-of-fold predictions for every candidate penalty, then choose the
+    # single lambda with the lowest revenue-scale RMSE across all held-out rows.
+    oof_by_lambda <- lapply(seq_along(lambdas), function(j) {
+      lambda <- lambdas[[j]]
+      pred <- rep(NA_real_, nrow(x))
+      for (i in seq_len(5L)) {
+        train_rows <- which(fold_id != i); test_rows <- which(fold_id == i)
+        fit_i <- ridge_fit(x[train_rows, , drop = FALSE], y[train_rows], lambda)
+        pred[test_rows] <- pmax(expm1(ridge_predict_log(fit_i, x[test_rows, , drop = FALSE])), 0)
+      }
+      pred
+    })
+    lambda_rmse <- vapply(oof_by_lambda, function(p) ridge_metrics(training$Total_MRR_12M, p)[["RMSE"]], numeric(1))
+    if (!any(is.finite(lambda_rmse))) stop("No ridge penalty produced finite cross-validation predictions.")
+    best_index <- which.min(lambda_rmse)
+    best_lambda <- lambdas[[best_index]]
+    oof_prediction <- oof_by_lambda[[best_index]]
+
     cv <- lapply(seq_len(5L), function(i) {
-      progress(0.35 + i * 0.10, paste("Secondary model CV fold", i))
-      a <- which(folds != i)
-      b <- which(folds == i)
-      dtrain <- xgboost::xgb.DMatrix(x[a, , drop = FALSE], label = y[a])
-      dtest <- xgboost::xgb.DMatrix(x[b, , drop = FALSE], label = y[b])
-      fit <- xgboost::xgb.train(params = xgb_parameters, data = dtrain, nrounds = 1000,
-                                watchlist = list(validation = dtest), early_stopping_rounds = 50, verbose = 0)
-      m <- metrics(expm1(y[b]), pmax(expm1(predict(fit, dtest)), 0))
-      best <- fit$best_iteration
-      if (is.null(best) || !is.finite(best)) best <- 1000L
-      tibble(Fold = i, RMSE = m[["RMSE"]], MAE = m[["MAE"]], R2 = m[["R2"]],
-             Best_Iteration = as.integer(best))
+      progress(0.35 + i * 0.10, paste("Ridge model CV fold", i))
+      rows <- which(fold_id == i)
+      m <- ridge_metrics(training$Total_MRR_12M[rows], oof_prediction[rows])
+      tibble(Fold = i, RMSE = m[["RMSE"]], MAE = m[["MAE"]], R2 = m[["R2"]], Lambda = best_lambda)
     }) %>% bind_rows()
-    rounds <- as.integer(round(mean(cv$Best_Iteration)))
-    fit <- xgboost::xgb.train(params = xgb_parameters, data = xgboost::xgb.DMatrix(x, label = y),
-                              nrounds = rounds, verbose = 0)
-    list(model = fit, encoder = encoder, eligible_rows = nrow(training), final_nrounds = rounds,
-         model_message = "Secondary historical all-product model ready; training excludes revenue below $1,000.",
+
+    progress(0.90, "Fitting the final browser-compatible ridge model")
+    fit <- ridge_fit(x, y, best_lambda)
+    fitted_revenue <- pmax(expm1(ridge_predict_log(fit, x)), 0)
+    overall <- ridge_metrics(training$Total_MRR_12M, oof_prediction)
+    importance <- tibble(
+      Feature = names(fit$beta),
+      Coefficient = as.numeric(fit$beta),
+      Abs_Coefficient = abs(as.numeric(fit$beta))
+    ) %>% arrange(desc(Abs_Coefficient), Feature)
+
+    list(model = fit, encoder = encoder, eligible_rows = nrow(training), final_lambda = best_lambda,
+         model_message = paste0("Browser-compatible ridge model ready; 5-fold CV selected lambda = ",
+                                format(best_lambda, scientific = TRUE, digits = 3),
+                                ". Training excludes revenue below $1,000."),
          historical_scores = tibble(GLM_ID = training$GLM_ID, Actual_Revenue = training$Total_MRR_12M,
-                                    Predicted_Revenue = pmax(expm1(predict(fit, xgboost::xgb.DMatrix(x))), 0)),
-         test_results = tibble(Actual_Revenue = actual, Predicted_Revenue = predictions), cv_results = cv,
-         importance_matrix = xgboost::xgb.importance(colnames(x), model = fit),
-         holdout_rmse = holdout[["RMSE"]], holdout_mae = holdout[["MAE"]], holdout_r2 = holdout[["R2"]])
+                                    Predicted_Revenue = fitted_revenue),
+         test_results = tibble(Actual_Revenue = training$Total_MRR_12M, Predicted_Revenue = oof_prediction),
+         cv_results = cv, importance_matrix = as.data.frame(importance),
+         holdout_rmse = overall[["RMSE"]], holdout_mae = overall[["MAE"]], holdout_r2 = overall[["R2"]])
   }, error = function(e) {
-    empty$model_message <- paste("Secondary model unavailable:", conditionMessage(e))
+    empty$model_message <- paste("Ridge model unavailable:", conditionMessage(e))
     empty
   })
 }
@@ -994,8 +1045,8 @@ score_new_dc <- function(bundle, new_dc, vintage = vintage_default) {
   if (!is.null(bundle$model)) {
     unknown_levels <- categorical_predictors[vapply(categorical_predictors,
                                                     function(name) !clean[[name]][[1]] %in% bundle$encoder$levels[[name]], logical(1))]
-    predicted <- tryCatch(as.numeric(pmax(expm1(predict(bundle$model,
-                                                        xgboost::xgb.DMatrix(encode_features(clean, bundle$encoder)))), 0)), error = function(e) NA_real_)
+    predicted <- tryCatch(as.numeric(pmax(expm1(ridge_predict_log(
+      bundle$model, encode_features(clean, bundle$encoder))), 0)), error = function(e) NA_real_)
   }
   errors <- sites %>% left_join(bundle$historical_scores, by = "GLM_ID") %>%
     mutate(Error_Pct = abs(Actual_Revenue - Predicted_Revenue) / pmax(Actual_Revenue, 1))
@@ -1153,29 +1204,33 @@ proposed_tier <- function(r, tiers) {
        tier = if (is.finite(rev)) tier_of(rev, lower, upper) else NA_character_)
 }
 
-# Model example sites, ranked by model similarity: the share of the model's trees in which
-# the historical GLM ends up in the same final group (leaf) as the proposed site.
+# Model example sites, ranked by closeness in the fitted ridge model's contribution space.
+# Differences on features with larger standardized coefficients count more; similarity is
+# exp(-distance), so 1 means identical model inputs and values approach 0 as sites diverge.
 model_influence <- function(b, r, perf, top_n = 5, same_segment_only = FALSE) {
   unavailable <- function(msg) list(available = FALSE, message = msg, top = tibble(), all = tibble())
-  if (is.null(b$model) || !requireNamespace("xgboost", quietly = TRUE)) return(unavailable(b$model_message))
+  if (is.null(b$model)) return(unavailable(b$model_message))
   tryCatch({
     train_df <- b$historical_profile[match(b$historical_scores$GLM_ID, b$historical_profile$GLM_ID), , drop = FALSE]
-    x_hist <- encode_features(train_df, b$encoder)
-    x_new <- encode_features(r$input, b$encoder)
-    leaves_hist <- predict(b$model, xgboost::xgb.DMatrix(x_hist), predleaf = TRUE)
-    leaves_new <- predict(b$model, xgboost::xgb.DMatrix(x_new), predleaf = TRUE)
-    if (is.null(dim(leaves_hist))) leaves_hist <- matrix(leaves_hist, nrow = nrow(x_hist))
-    leaves_new <- as.vector(leaves_new)
-    if (ncol(leaves_hist) != length(leaves_new)) stop("Tree leaf output has an unexpected shape.")
-    shared <- sweep(leaves_hist, 2, leaves_new, `==`) * 1
-    leaf_size <- colSums(shared)
-    per_tree <- sweep(shared, 2, pmax(leaf_size, 1), `/`)
-    influence <- rowSums(per_tree) / sum(leaf_size > 0)
-    all <- tibble(GLM_ID = train_df$GLM_ID, Influence_Share = influence, Model_Similarity = rowMeans(shared))
+    x_hist <- ridge_standardize(b$model, encode_features(train_df, b$encoder))
+    x_new <- as.numeric(ridge_standardize(b$model, encode_features(r$input, b$encoder)))
+    delta <- sweep(x_hist, 2, x_new, `-`)
+    weights <- abs(b$model$beta)
+    weight_norm <- sqrt(sum(weights ^ 2))
+    if (is.finite(weight_norm) && weight_norm > 0) {
+      distance <- sqrt(rowSums(sweep(delta, 2, weights, `*`) ^ 2)) / weight_norm
+    } else {
+      distance <- sqrt(rowMeans(delta ^ 2))
+    }
+    similarity <- exp(-pmax(distance, 0))
+    similarity_total <- sum(similarity)
+    if (!is.finite(similarity_total) || similarity_total <= 0) similarity <- rep(1, length(distance))
+    influence <- similarity / sum(similarity)
+    all <- tibble(GLM_ID = train_df$GLM_ID, Influence_Share = influence, Model_Similarity = similarity)
     if (isTRUE(same_segment_only)) {
       keep <- train_df$DC_Segments == r$input$DC_Segments[[1]]
       all <- all[keep, , drop = FALSE]
-      all$Influence_Share <- all$Influence_Share / sum(all$Influence_Share)
+      if (nrow(all)) all$Influence_Share <- all$Influence_Share / sum(all$Influence_Share)
     }
     inp <- r$input
     all <- all %>%
@@ -1199,27 +1254,21 @@ model_influence <- function(b, r, perf, top_n = 5, same_segment_only = FALSE) {
     top <- head(all, top_n)
     list(available = TRUE, message = NULL, all = all, top = top,
          top_share = sum(top$Influence_Share), top_similarity = safe_mean(top$Model_Similarity),
-         top_median_revenue = safe_median(top$Revenue), trees = sum(leaf_size > 0),
-         sites = nrow(all))
+         top_median_revenue = safe_median(top$Revenue), features = length(b$model$beta), sites = nrow(all))
   }, error = function(e) unavailable(paste("Model example sites unavailable:", conditionMessage(e))))
 }
 
-# What drove the prediction: the model's own per-input contributions (SHAP values),
-# grouped back to the original inputs and shown as multipliers on a typical site.
+# Exact additive contributions of the ridge model on the log-revenue scale, grouped
+# back to the original business inputs and displayed as multiplicative effects.
 prediction_breakdown <- function(b, r) {
   unavailable <- function(msg) list(available = FALSE, message = msg, table = tibble())
-  if (is.null(b$model) || !requireNamespace("xgboost", quietly = TRUE)) return(unavailable(b$model_message))
+  if (is.null(b$model)) return(unavailable(b$model_message))
   tryCatch({
     inp <- r$input
-    x_new <- encode_features(inp, b$encoder)
-    contrib <- predict(b$model, xgboost::xgb.DMatrix(x_new), predcontrib = TRUE)
-    contrib_names <- colnames(contrib)
-    if (is.null(contrib_names)) contrib_names <- c(colnames(x_new), "BIAS")
-    contrib <- matrix(as.numeric(contrib), nrow = 1, dimnames = list(NULL, contrib_names))
-    cols <- colnames(contrib)
-    bias_col <- if (any(cols %in% c("BIAS", "(Intercept)"))) which(cols %in% c("BIAS", "(Intercept)"))[[1]] else length(cols)
-    bias <- contrib[1, bias_col]
-    effects <- contrib[1, -bias_col]
+    x_new <- ridge_standardize(b$model, encode_features(inp, b$encoder))
+    effects <- as.numeric(x_new[1, ]) * b$model$beta
+    names(effects) <- b$model$feature_names
+    bias <- b$model$intercept
     feature <- vapply(names(effects), function(col) {
       if (col %in% numeric_predictors) return(col)
       for (name in categorical_predictors) if (startsWith(col, paste0(make.names(name), "_"))) return(name)
@@ -1243,8 +1292,8 @@ prediction_breakdown <- function(b, r) {
     level <- exp(bias) * cumprod(tab$Multiplier)
     tab$Dollar_Change <- diff(c(exp(bias), level))
     tab$Running_Total <- level - 1
-    list(available = TRUE, message = NULL, baseline = expm1(bias), prediction = max(expm1(bias + sum(effects)), 0),
-         table = tab)
+    list(available = TRUE, message = NULL, baseline = expm1(bias),
+         prediction = max(expm1(bias + sum(effects)), 0), table = tab)
   }, error = function(e) unavailable(paste("Prediction breakdown unavailable:", conditionMessage(e))))
 }
 
@@ -1731,7 +1780,7 @@ ui <- fluidPage(
                      DTOutput("drv_table"),
                      uiOutput("sanity_check"),
                      details_panel("Sanity check: sites the model sees as most similar", DTOutput("infl_table"),
-                                   p(class = "context-note", "Reference only, not used in any calculation. Model similarity = share of the model's decision trees that put the site in the same group as the proposed site.")))
+                                   p(class = "context-note", "Reference only, not used in any calculation. Ridge similarity is based on distance in standardized model-input space, weighted by the fitted ridge coefficients; 100% means identical model inputs.")))
         ),
         tabPanel("Matched GLMs",
                  div(class = "section-panel", section_heading("Matched historical facilities", "Closest on-net facilities ranked by physical similarity"),
@@ -1792,16 +1841,16 @@ ui <- fluidPage(
                          metric_card("In-sample error heuristic", "heuristic_range", "Not a confidence interval."),
                          metric_card("Median absolute percentage error", "similar_error_pct", "Selected fitted sites; not cross-validation error."),
                          metric_card("CV RMSE", "cv_rmse"), metric_card("CV R-squared", "cv_r2"))),
-                 details_panel("Held-out plot, CV folds & feature importance",
+                 details_panel("Out-of-fold plot, CV folds & ridge coefficients",
                                plotOutput("actual_predicted_plot", height = 300),
                                h4("Cross-validation folds"), DTOutput("cv_table"),
-                               h4("Feature importance"), DTOutput("importance_table")),
+                               h4("Standardized ridge coefficients"), DTOutput("importance_table")),
                  details_panel("Matching & calculation methods",
                                p("Same source pool: confirmed on-net GLMs, segments 1–5, finite annual revenue of at least $1,000. Zero and lower revenue remain excluded by the existing filter."),
                                p("City/state/segment, then state/segment, then national segment; up to 25 closest physical matches. Small pools are not padded. Size, capacity and urban/rural determine closeness."),
                                DTOutput("scope_table"),
                                p("Business summaries use arithmetic averages of valid site values. % billed averages per-GLM ratios, not pooled counts. Unique counts cannot be deduplicated across GLMs."),
-                               p("Secondary training retains its existing settings. Numeric missing-value imputation and the fitted-error heuristic still use medians; heuristic bounds are not calibrated intervals.")),
+                               p("The secondary model is ridge regression on log annual revenue. Predictors are square footage, capacity, state, city, urban/rural and DC segment; CAPEX remains excluded. Numeric missing values use training medians, categorical values are one-hot encoded, and 5-fold cross-validation selects the ridge penalty. Heuristic bounds are not calibrated intervals.")),
                  details_panel("Average samples & size-adjusted references",
                                DTOutput("average_samples_table"),
                                div(class = "reference-grid", metric_card("Average size-adjusted annual revenue", "size_anchor"),
@@ -2566,10 +2615,10 @@ server <- function(input, output, session) {
   })
   output$actual_predicted_plot <- renderPlot({
     b <- model_bundle(); req(b)
-    validate(need(nrow(b$test_results) > 0, "Secondary historical model unavailable; physical comparables still work."))
+    validate(need(nrow(b$test_results) > 0, "Secondary ridge model unavailable; physical comparables still work."))
     ggplot(b$test_results, aes(Actual_Revenue, Predicted_Revenue)) + geom_point(alpha = 0.6, color = "#0f6cbd") +
       geom_abline(slope = 1, intercept = 0, linetype = 2) + scale_x_continuous(labels = dollar) +
-      scale_y_continuous(labels = dollar) + labs(x = "Actual observed 12M all-product revenue", y = "Predicted 12M all-product revenue") + theme_minimal()
+      scale_y_continuous(labels = dollar) + labs(x = "Actual observed 12M all-product revenue", y = "Out-of-fold predicted 12M all-product revenue") + theme_minimal()
   })
   output$cv_table <- renderDT({
     b <- model_bundle(); req(b)
@@ -2580,7 +2629,8 @@ server <- function(input, output, session) {
   output$importance_table <- renderDT({
     b <- model_bundle(); req(b)
     validate(need(nrow(b$importance_matrix) > 0, b$model_message))
-    datatable(head(as.data.frame(b$importance_matrix), 25), rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE))
+    datatable(head(as.data.frame(b$importance_matrix), 25), rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE)) %>%
+      formatRound(c("Coefficient", "Abs_Coefficient"), 4)
   })
   
   output$npv_card <- renderText({ r <- scoring_result(); req(r); fmt_dollar(r$financials$npv) })
