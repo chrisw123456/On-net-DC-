@@ -1,14 +1,65 @@
 # On-Net Data Center Characteristics, Customer Data and Model
-# Version 5.4-shinylive — browser-hosted; workbook supplied by the user at runtime.
-# The Excel workbook is never bundled with the published static site.
+# Version 17.11 — model training set option: all eligible GLMs (default) or only GLMs first billed in/after a
+#             cutoff year (dc_bill_date, default 2019). Applied on Load workbook. Matching pool, class limits and
+#             portfolio tables stay on all eligible GLMs.
+# Version 17.10 — growth table reordered to read left to right: capacity -> 400G waves -> wave price -> revenue
+#             opportunity (= waves x price x 12) -> comparisons; section note rewritten in the same order.
+# Version 17.9 — growth section has its own starting 400G wave price ($5,400/month, editable): yearly wave price
+#             and 400G wave equivalents (revenue / (price x 12)). The 4MC financials keep $5,000 and -2%/yr.
+# Version 17.8 — first bill year (dc_bill_date; 'Before 2019' for 0 / blank) shown in every site-level table.
+# Version 17.7 — vintage filter now uses dc_bill_date from 'main' (first bill year, 2019+; 0 / blank = before 2019):
+#             all GLMs / first billed in or after the cutoff year (default 2019) / not (earlier or 0).
+# Version 17.6 — on-net vintage filter for matching: all GLMs, on-net in/after a cutoff year (default 2019)
+#             or before it, with or without GLMs missing an on-net date. Uses onnet_date (Year_Build is mostly
+#             'Baseline (2025)' / NF for existing sites). The model and class limits stay on the full portfolio.
+# Version 17.5 — upload limit raised to 300 MB (Shiny default is 5 MB); order upload reads a temporary copy (works while the file is open in Excel or syncing in
+#             OneDrive) and explains unreadable files (protected / sensitivity-labelled, .xls, empty).
+# Version 17.4 — order data goes back to its own upload in the sidebar (xlsx or csv), independent of the
+#             modeling workbook; the selectable order period and annual-rate comparison are kept.
+# Version 17.3 — order data (DC order extract) loads automatically with the workbook and is shown as a
+#             comparison on matched GLMs: new-order MRR over a selectable period (default: all months
+#             in the extract), as an annual rate and as a % of billed revenue. Display only: never a
+#             model input, never used in matching or performer classes.
+# Version 17.2 — -10% annual 400G wave pricing added to the future bandwidth growth section:
+#             revenue = predicted revenue x capacity factor x wave price factor (0.90^(year-1)).
+# Version 6.0.2 — Match Score explainer and per-match score summary on the Matched GLMs tab.
+# Version 6.0.1 — predicted annual revenue shown as the baseline in the capacity-factor section.
+# Version 6.0 — future growth uses the capacity-factor table (ramp factor x 8.7% annual compute
+#             density increase) instead of the generic bandwidth-growth scenarios.
+# Version 5.9.4 — matched-site comparison off by default; proposed inputs vs matched averages
+#               (with each input's effect on the prediction); model-vs-comparables card removed.
+# Version 5.9.3 — toggle to exclude / include High-Low sites in the Overview averages; optional
+#               comparables-based revenue benchmark (customers x revenue per customer).
+# Version 5.9.2 — Medium-only tenants/customers (with compact all-sites comparison); model-similarity
+#               section reduced to a one-line sanity check; tab renamed Model explanation.
+# Version 5.9.1 — class profile and ranking chart toggles: matched sites vs entire segment portfolio.
+# Version 5.9 — ONE unified High / Medium / Low system (top / middle / bottom % of annual revenue
+#             within segment, portfolio-wide) used by the Overview benchmark, positioning and ranking.
+# Version 5.8.6 — visual step-by-step prediction breakdown; clearer model-similarity section.
+# Version 5.8.5 — urban / rural choices populated from the loaded workbook.
+# Version 5.8.4 — CAPEX column optional in the workbook.
+# Version 5.8.3 — default outlier rule = portfolio IQR by segment; predicted performer class in positioning.
+# Version 5.8.2 — outlier rule bar at the top of the benchmark; portfolio (same-segment) IQR option
+#               and portfolio-wide outlier flags on the Performance ranking tab.
+# Version 5.8.1 — outlier rule defaults to a multiple of the group median (IQR rule optional).
+# Version 5.8 — one comparison group: matched sites classified High / Medium / Low among themselves;
+#             Overview order Comparable -> Projected -> Outlier-Adjusted Benchmark.
+# Version 5.7.3 — Performer Classification section, peer-median explainer and peer drill-down.
+# Version 5.7.2 — CAPEX removed from the XGBoost model inputs (financials only).
+# Version 5.7 — High / Medium / Low performer classification (outliers vs segment, market, size,
+#               power and on-net date peers); revenue averages use Medium performers only.
+# Version 5.6 — performance "vs peers" replaces model-expected revenue; model similarity and
+#               prediction-driver breakdown make the example sites explainable.
+# Version 5.5 — adds portfolio performance ranking/buckets and top model example sites.
+# Version 5.4 — factual matched-GLM views, averages and all original workbook fields.
 # Annual revenue is the existing Aug 2025-Jul 2026 sum; it is not multiplied by 12.
 # Billed percentage uses the workbook's normalized unique-customer denominator.
-# Matching, source eligibility, browser-model training and 4MC calculations are retained.
+# Matching, source eligibility, secondary training and 4MC calculations are retained.
 # Site summary is the last matched snapshot; re-match after changing inputs.
 
 required_packages <- c(
   "shiny", "DT", "readxl", "dplyr", "tidyr", "readr", "tibble",
-  "ggplot2", "scales"
+  "ggplot2", "scales", "xgboost"
 )
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
@@ -27,13 +78,15 @@ library(tibble)
 library(ggplot2)
 library(scales)
 
-options(scipen = 999, shiny.maxRequestSize = 150 * 1024^2)
+options(scipen = 999)
+# Shiny's default upload limit is 5 MB; the order extract is ~14 MB as .xlsx (larger as .csv). Allow up to 300 MB.
+options(shiny.maxRequestSize = 300 * 1024^2)
 set.seed(123)
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-workbook_placeholder <- "Choose an Excel workbook (.xlsx or .xls)"
+default_file_path <- "OnNetDC_Modeling (2) (2).xlsx"
 default_sheet_name <- "main"
 target_column <- "Total_MRR_12M"
 id_column <- "GLM_ID"
@@ -46,22 +99,33 @@ capex_column <- "CAPEX"
 historical_tam_column <- "TAM_(2030)"
 quote_text_column <- "BandwidthQuoting_Last12Months_(>= 10G)"
 revenue_window <- "Aug 2025-Jul 2026"
+# Order data (comparison only). Separate optional upload in the sidebar; if none is chosen, the file
+# below in the app folder is used when "Load order data" is clicked.
+default_order_file_path <- "DC_Order_Data_Analysis.xlsx"
+default_order_sheet_name <- "Data"
+order_required_columns <- c("DC_GLM_ID", "SALES_RPT_PERIOD_DATE", "MRR_NET_SALES")
 valid_segments <- as.character(1:5)
-numeric_predictors <- c("SQ_foot", "Capacity", "CAPEX")
+# CAPEX is deliberately NOT a model input: it drives the 4MC financials only.
+numeric_predictors <- c("SQ_foot", "Capacity")
 categorical_predictors <- c("state", "city", "urban_rural", "DC_Segments")
 predictor_columns <- c(numeric_predictors, categorical_predictors)
 required_columns <- c(
-  "GLM_ID", "is_on_net", "Total_MRR_12M", "SQ_foot", "Bandwidth", "CAPEX",
+  "GLM_ID", "is_on_net", "Total_MRR_12M", "SQ_foot", "Bandwidth",
   "Year_Build", "state", "city", "DC_Segments", "derived_tenant_count",
   "Unique_Billing_Customer_Count_12M"
 )
 optional_columns <- c(
   "address", "DC_Operator", "urban_rural", "TAM_(2030)",
   "Tenant_Norm_Unique_UC_Count", "Unique_Billing_Customer_Count_3M",
-  "QuoteCount_Last_12Months", quote_text_column, "Maturity_Score", "NaaSEnabled"
+  "QuoteCount_Last_12Months", quote_text_column, "Maturity_Score", "NaaSEnabled", "onnet_date", "dc_bill_date",
+  "CAPEX"  # optional: only used for the historical 4MC financials, never for matching or the model
 )
 
-browser_model_lambda <- 1
+xgb_parameters <- list(
+  objective = "reg:squarederror", eval_metric = "rmse", eta = 0.03,
+  max_depth = 5, min_child_weight = 5, subsample = 0.80,
+  colsample_bytree = 0.80
+)
 
 # Static 4MC assumptions
 projection_years <- 2026:2035
@@ -133,19 +197,51 @@ safe_percentile <- function(reference, value) {
   as.numeric(ecdf(reference)(value))
 }
 
-future_bandwidth_growth <- function(current_revenue, start_year, horizon_years = 5,
-                                    bandwidth_growth_rate = 0.10, revenue_capture_rate = 0.50) {
-  values <- c(current_revenue, start_year, horizon_years, bandwidth_growth_rate, revenue_capture_rate)
-  if (any(!is.finite(values)) || current_revenue < 0 || horizon_years < 1 ||
-      bandwidth_growth_rate < 0 || revenue_capture_rate < 0 || revenue_capture_rate > 1) return(tibble())
-  year_index <- 0:as.integer(horizon_years)
-  bandwidth_index <- (1 + bandwidth_growth_rate) ^ year_index
-  revenue_index <- 1 + revenue_capture_rate * (bandwidth_index - 1)
-  tibble(Year = as.integer(start_year) + year_index, Year_From_Start = year_index,
-         Bandwidth_Demand_Index = bandwidth_index, Revenue_Capture_Rate = revenue_capture_rate,
-         Revenue_Growth_Index = revenue_index,
-         Future_Revenue_Opportunity = current_revenue * revenue_index,
-         Incremental_Revenue_Opportunity = current_revenue * (revenue_index - 1))
+# Capacity-factor growth outlook (replaces the generic bandwidth-growth scenarios).
+# Final yearly capacity factor = standard ramp factor x compute density increase factor, where the
+# compute density factor compounds at the annual rate from operating year 1 (year 1 = 1.000).
+# Annual revenue opportunity = predicted annual revenue (a fully ramped site at today's density) x factor.
+capacity_ramp_default <- c(year1 = 0.33, year2 = 0.66, mature = 0.95)
+compute_density_increase_default <- 0.087
+capacity_horizon_default <- 10L
+wave_price_change_default <- -0.10   # annual 400G wave price change (-10% per year, compounding)
+wave_price_start_default <- 5400     # growth-section starting 400G wave price ($/month); separate from 4MC price_400g_2026
+
+capacity_factor_table <- function(horizon_years = capacity_horizon_default, ramp = capacity_ramp_default,
+                                  density_increase = compute_density_increase_default) {
+  horizon_years <- as.integer(horizon_years)
+  if (!is.finite(horizon_years) || horizon_years < 1 || any(!is.finite(ramp)) || any(ramp < 0) ||
+      !is.finite(density_increase) || density_increase < 0) return(tibble())
+  op_year <- seq_len(horizon_years)
+  ramp_factor <- ifelse(op_year == 1, ramp[[1]], ifelse(op_year == 2, ramp[[2]], ramp[[3]]))
+  density_factor <- (1 + density_increase) ^ (op_year - 1)
+  tibble(Operating_Year = op_year, Ramp_Factor = ramp_factor, Compute_Density_Factor = density_factor,
+         Capacity_Factor = ramp_factor * density_factor)
+}
+
+# Wave pricing: the 400G wave price moves by price_change each year from operating year 1
+# (year 1 = today's price, factor 1.000), so wave price factor = (1 + price_change)^(year - 1).
+# Volume revenue (constant price) = predicted revenue x capacity factor;
+# Revenue opportunity (price-adjusted) = volume revenue x wave price factor.
+capacity_growth_outlook <- function(current_revenue, start_year, horizon_years = capacity_horizon_default,
+                                    ramp = capacity_ramp_default, density_increase = compute_density_increase_default,
+                                    price_change = wave_price_change_default, start_price = wave_price_start_default) {
+  f <- capacity_factor_table(horizon_years, ramp, density_increase)
+  if (!nrow(f) || !is.finite(current_revenue) || current_revenue < 0 ||
+      !is.finite(price_change) || price_change <= -1 || !is.finite(start_price) || start_price <= 0) return(tibble())
+  first_year <- if (is.finite(start_year)) as.integer(start_year) else NA_integer_
+  f %>% mutate(Calendar_Year = if (is.na(first_year)) NA_integer_ else first_year + Operating_Year - 1L,
+               Phase = ifelse(Ramp_Factor < ramp[[3]], "Ramp-up", "Mature"),
+               Wave_Price_Factor = (1 + price_change) ^ (Operating_Year - 1),
+               Net_Revenue_Factor = Capacity_Factor * Wave_Price_Factor,
+               Volume_Revenue = current_revenue * Capacity_Factor,
+               Revenue_Opportunity = Volume_Revenue * Wave_Price_Factor,
+               Pricing_Impact = Revenue_Opportunity - Volume_Revenue,
+               Change_vs_Predicted = Revenue_Opportunity - current_revenue,
+               Cumulative_Volume_Revenue = cumsum(Volume_Revenue),
+               Cumulative_Revenue = cumsum(Revenue_Opportunity),
+               Wave_Price = start_price * Wave_Price_Factor,
+               Wave_Equivalents = Revenue_Opportunity / (Wave_Price * 12))
 }
 
 safe_mean <- function(x) {
@@ -323,7 +419,7 @@ calculate_4mc_financials <- function(
   )
 }
 # -----------------------------------------------------------------------------
-# Cleaning, quoting and browser-compatible historical model
+# Cleaning, quoting and secondary historical model
 # -----------------------------------------------------------------------------
 clean_number <- function(x) {
   suppressWarnings(parse_number(as.character(x),
@@ -406,116 +502,186 @@ encode_features <- function(df, encoder) {
   x
 }
 
-fit_browser_model <- function(x, y, lambda = browser_model_lambda) {
-  x <- as.matrix(x)
-  center <- colMeans(x)
-  scale <- apply(x, 2, stats::sd)
-  scale[!is.finite(scale) | scale == 0] <- 1
-  standardized <- sweep(sweep(x, 2, center, "-"), 2, scale, "/")
-  design <- cbind(`(Intercept)` = 1, standardized)
-  penalty <- diag(ncol(design))
-  penalty[1, 1] <- 0
-  coefficients <- tryCatch(
-    solve(crossprod(design) + lambda * penalty, crossprod(design, y)),
-    error = function(e) qr.solve(crossprod(design) + lambda * penalty, crossprod(design, y))
-  )
-  list(coefficients = as.numeric(coefficients), center = center, scale = scale,
-       feature_names = colnames(x), lambda = lambda)
-}
-
-predict_browser_model <- function(model, x) {
-  x <- as.matrix(x)
-  missing <- setdiff(model$feature_names, colnames(x))
-  if (length(missing)) {
-    padding <- matrix(0, nrow = nrow(x), ncol = length(missing),
-                      dimnames = list(NULL, missing))
-    x <- cbind(x, padding)
-  }
-  x <- x[, model$feature_names, drop = FALSE]
-  standardized <- sweep(sweep(x, 2, model$center, "-"), 2, model$scale, "/")
-  as.numeric(cbind(1, standardized) %*% model$coefficients)
-}
-
-browser_model_importance <- function(model) {
-  importance <- abs(model$coefficients[-1])
-  if (!length(importance)) return(data.frame())
-  total <- sum(importance)
-  data.frame(
-    Feature = model$feature_names,
-    Gain = if (is.finite(total) && total > 0) importance / total else importance,
-    stringsAsFactors = FALSE
-  ) |>
-    dplyr::arrange(dplyr::desc(Gain))
-}
-
 train_secondary_model <- function(profile, progress) {
   training <- profile %>% filter(is.finite(Total_MRR_12M), Total_MRR_12M >= minimum_revenue)
   empty <- list(
     model = NULL, encoder = NULL, eligible_rows = nrow(training), final_nrounds = NA_integer_,
-    model_message = "Browser regression unavailable: at least 20 eligible rows are required.",
+    model_message = "XGBoost unavailable: insufficient eligible rows or package not installed.",
     historical_scores = tibble(GLM_ID = character(), Actual_Revenue = numeric(), Predicted_Revenue = numeric()),
     test_results = tibble(Actual_Revenue = numeric(), Predicted_Revenue = numeric()),
-    cv_results = tibble(Fold = integer(), RMSE = numeric(), MAE = numeric(), R2 = numeric()),
+    cv_results = tibble(Fold = integer(), RMSE = numeric(), MAE = numeric(), R2 = numeric(), Best_Iteration = integer()),
     importance_matrix = data.frame(), holdout_rmse = NA_real_, holdout_mae = NA_real_, holdout_r2 = NA_real_
   )
-  if (nrow(training) < 20L) return(empty)
+  if (nrow(training) < 20L || !requireNamespace("xgboost", quietly = TRUE)) return(empty)
   tryCatch({
     encoder <- fit_encoder(training)
     x <- encode_features(training, encoder)
     y <- log1p(training$Total_MRR_12M)
+    set.seed(123)
+    train_index <- sample(seq_len(nrow(x)), floor(0.8 * nrow(x)))
+    test_index <- setdiff(seq_len(nrow(x)), train_index)
+    train <- xgboost::xgb.DMatrix(x[train_index, , drop = FALSE], label = y[train_index])
+    test <- xgboost::xgb.DMatrix(x[test_index, , drop = FALSE], label = y[test_index])
+    progress(0.28, "Training secondary all-product historical model")
+    validation_model <- xgboost::xgb.train(params = xgb_parameters, data = train, nrounds = 1000,
+                                           watchlist = list(validation = test), early_stopping_rounds = 50, verbose = 0)
+    predictions <- pmax(expm1(predict(validation_model, test)), 0)
+    actual <- expm1(y[test_index])
     metrics <- function(a, p) {
       denominator <- sum((a - mean(a))^2)
       c(RMSE = sqrt(mean((a - p)^2)), MAE = mean(abs(a - p)),
         R2 = if (denominator > 0) 1 - sum((a - p)^2) / denominator else NA_real_)
     }
-    set.seed(123)
-    train_index <- sample(seq_len(nrow(x)), floor(0.8 * nrow(x)))
-    test_index <- setdiff(seq_len(nrow(x)), train_index)
-    progress(0.28, "Training browser-compatible historical revenue model")
-    validation_model <- fit_browser_model(x[train_index, , drop = FALSE], y[train_index])
-    predictions <- pmax(expm1(predict_browser_model(validation_model, x[test_index, , drop = FALSE])), 0)
-    actual <- expm1(y[test_index])
     holdout <- metrics(actual, predictions)
     set.seed(123)
     folds <- sample(rep(seq_len(5L), length.out = nrow(x)))
     cv <- lapply(seq_len(5L), function(i) {
-      progress(0.35 + i * 0.10, paste("Browser model CV fold", i))
+      progress(0.35 + i * 0.10, paste("Secondary model CV fold", i))
       a <- which(folds != i)
       b <- which(folds == i)
-      fit <- fit_browser_model(x[a, , drop = FALSE], y[a])
-      m <- metrics(expm1(y[b]), pmax(expm1(predict_browser_model(fit, x[b, , drop = FALSE])), 0))
-      tibble(Fold = i, RMSE = m[["RMSE"]], MAE = m[["MAE"]], R2 = m[["R2"]])
+      dtrain <- xgboost::xgb.DMatrix(x[a, , drop = FALSE], label = y[a])
+      dtest <- xgboost::xgb.DMatrix(x[b, , drop = FALSE], label = y[b])
+      fit <- xgboost::xgb.train(params = xgb_parameters, data = dtrain, nrounds = 1000,
+                                watchlist = list(validation = dtest), early_stopping_rounds = 50, verbose = 0)
+      m <- metrics(expm1(y[b]), pmax(expm1(predict(fit, dtest)), 0))
+      best <- fit$best_iteration
+      if (is.null(best) || !is.finite(best)) best <- 1000L
+      tibble(Fold = i, RMSE = m[["RMSE"]], MAE = m[["MAE"]], R2 = m[["R2"]],
+             Best_Iteration = as.integer(best))
     }) %>% bind_rows()
-    fit <- fit_browser_model(x, y)
-    fitted <- pmax(expm1(predict_browser_model(fit, x)), 0)
-    list(model = fit, encoder = encoder, eligible_rows = nrow(training), final_nrounds = NA_integer_,
-         model_message = paste0("Browser-compatible ridge revenue model ready (lambda = ",
-                                browser_model_lambda, "); training excludes revenue below $1,000."),
+    rounds <- as.integer(round(mean(cv$Best_Iteration)))
+    fit <- xgboost::xgb.train(params = xgb_parameters, data = xgboost::xgb.DMatrix(x, label = y),
+                              nrounds = rounds, verbose = 0)
+    list(model = fit, encoder = encoder, eligible_rows = nrow(training), final_nrounds = rounds,
+         model_message = "Secondary historical all-product model ready; training excludes revenue below $1,000.",
          historical_scores = tibble(GLM_ID = training$GLM_ID, Actual_Revenue = training$Total_MRR_12M,
-                                    Predicted_Revenue = fitted),
+                                    Predicted_Revenue = pmax(expm1(predict(fit, xgboost::xgb.DMatrix(x))), 0)),
          test_results = tibble(Actual_Revenue = actual, Predicted_Revenue = predictions), cv_results = cv,
-         importance_matrix = browser_model_importance(fit),
+         importance_matrix = xgboost::xgb.importance(colnames(x), model = fit),
          holdout_rmse = holdout[["RMSE"]], holdout_mae = holdout[["MAE"]], holdout_r2 = holdout[["R2"]])
   }, error = function(e) {
-    empty$model_message <- paste("Browser regression unavailable:", conditionMessage(e))
+    empty$model_message <- paste("Secondary model unavailable:", conditionMessage(e))
     empty
   })
 }
 
-build_model_bundle <- function(file_path, workbook_name, sheet_name, progress_callback = NULL) {
+# -----------------------------------------------------------------------------
+# Order data (comparison only)
+# -----------------------------------------------------------------------------
+parse_order_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  txt <- trimws(as.character(x))
+  num <- suppressWarnings(as.numeric(txt))
+  out <- as.Date(rep(NA_character_, length(txt)))
+  serial <- is.finite(num) & num > 20000 & num < 80000
+  out[serial] <- as.Date(num[serial], origin = "1899-12-30")
+  rest <- !serial & !is.na(txt) & nzchar(txt)
+  if (any(rest)) {
+    out[rest] <- as.Date(suppressWarnings(as.POSIXct(substr(txt[rest], 1, 10), format = "%Y-%m-%d", tz = "UTC")))
+    still <- rest & is.na(out)
+    if (any(still)) out[still] <- as.Date(txt[still], tryFormats = c("%m/%d/%Y", "%Y/%m/%d"), optional = TRUE)
+  }
+  out
+}
+month_start <- function(x) as.Date(format(x, "%Y-%m-01"))
+months_between <- function(from, to) {
+  if (!length(from) || !length(to) || is.na(from) || is.na(to) || to < from) return(0L)
+  length(seq(month_start(from), month_start(to), by = "month"))
+}
+
+# Reads the order extract into GLM x month totals (small enough to re-filter instantly by period).
+# Explains why an Excel file cannot be opened, from its first bytes.
+describe_unreadable_excel <- function(path) {
+  size <- suppressWarnings(file.info(path)$size)
+  if (!is.finite(size) || size == 0) return("the file is empty or not downloaded yet (in OneDrive, right-click it and choose 'Always keep on this device').")
+  sig <- tryCatch(readBin(path, "raw", n = 4), error = function(e) raw())
+  if (length(sig) == 4 && identical(sig, as.raw(c(0xD0, 0xCF, 0x11, 0xE0))))
+    return("the file is protected (a sensitivity label or password encrypts it) or is an old .xls saved as .xlsx. Save a copy as CSV (or as an unprotected .xlsx) and upload that.")
+  if (length(sig) >= 2 && !identical(sig[1:2], as.raw(c(0x50, 0x4B))))
+    return("the file is not a real .xlsx workbook. Open it in Excel and save as .xlsx or CSV.")
+  "Excel could not open it. Close it in Excel, or save a copy as CSV and upload that."
+}
+
+load_order_months <- function(path, sheet = default_order_sheet_name, file_name = path) {
+  # Read from a temporary copy so an open (locked) or syncing file still loads.
+  ext <- tolower(tools::file_ext(file_name)); if (!nzchar(ext)) ext <- "xlsx"
+  tmp <- tempfile(fileext = paste0(".", ext))
+  if (!isTRUE(file.copy(path, tmp, overwrite = TRUE))) stop("could not read the file (it may be locked or not downloaded from OneDrive).")
+  on.exit(unlink(tmp), add = TRUE)
+  path <- tmp
+  raw <- if (ext == "csv") {
+    readr::read_csv(path, show_col_types = FALSE, guess_max = 50000)
+  } else {
+    sheets <- tryCatch(excel_sheets(path), error = function(e) stop(describe_unreadable_excel(path), call. = FALSE))
+    if (!sheet %in% sheets) {
+      if (length(sheets) == 1) sheet <- sheets[[1]] else stop("Order sheet '", sheet, "' not found. Sheets: ", paste(sheets, collapse = ", "))
+    }
+    tryCatch(read_excel(path, sheet = sheet, guess_max = 50000), error = function(e) stop(describe_unreadable_excel(path), call. = FALSE))
+  }
+  missing <- setdiff(order_required_columns, names(raw))
+  if (length(missing)) stop("Order data is missing required columns: ", paste(missing, collapse = ", "))
+  product <- if ("PRODUCT_TIER_2" %in% names(raw)) toupper(trimws(as.character(raw$PRODUCT_TIER_2))) else NA_character_
+  orders <- tibble(
+    GLM_ID = clean_text(raw$DC_GLM_ID),
+    Month = month_start(parse_order_date(raw$SALES_RPT_PERIOD_DATE)),
+    MRR = if (is.numeric(raw$MRR_NET_SALES)) as.numeric(raw$MRR_NET_SALES) else clean_number(raw$MRR_NET_SALES),
+    Is_Wave = !is.na(product) & grepl("^WAVELENGTHS", product)
+  ) %>% filter(GLM_ID != "UNKNOWN", !is.na(Month), is.finite(MRR))
+  if (!nrow(orders)) stop("Order data has no usable rows (GLM, period and MRR).")
+  months <- orders %>% group_by(GLM_ID, Month) %>%
+    summarise(Order_Lines = n(), New_Order_MRR = sum(MRR), Wave_Order_MRR = sum(MRR[Is_Wave]), .groups = "drop")
+  list(months = months, glms_any_period = unique(orders$GLM_ID), rows = nrow(orders),
+       first_month = min(orders$Month), last_month = max(orders$Month))
+}
+
+# Totals per GLM for the chosen months. MRR_NET_SALES is the monthly recurring revenue of each new order, so
+# annual rate = (total new-order MRR / months in period) x 12 months of bookings x 12 months of billing:
+# the annual revenue value of one year's new orders. Any period length then compares with annual billed revenue
+# (for a 12-month period it is simply total new-order MRR x 12).
+order_period_summary <- function(od, from = od$first_month, to = od$last_month) {
+  from <- max(month_start(from), od$first_month); to <- min(month_start(to), od$last_month)
+  n_months <- months_between(from, to)
+  by_glm <- od$months %>% filter(Month >= from, Month <= to) %>% group_by(GLM_ID) %>%
+    summarise(Order_Lines = sum(Order_Lines), New_Order_MRR = sum(New_Order_MRR),
+              Wave_Order_MRR = sum(Wave_Order_MRR), .groups = "drop") %>%
+    mutate(Annual_Order_Rate = if (n_months > 0) New_Order_MRR / n_months * 12 * 12 else NA_real_)
+  list(by_glm = by_glm, glms_any_period = od$glms_any_period, n_months = n_months,
+       label = if (n_months > 0) paste0(format(from, "%b %Y"), " - ", format(to, "%b %Y"), " (", n_months, " months)") else "no months selected")
+}
+
+# Adds order columns to sites (needs GLM_ID, Total_MRR_12M). 'No orders in period' = GLM is in the extract
+# but had none in the chosen months (a true $0); 'Not in order extract' = no data (left blank).
+attach_order_activity <- function(sites, op) {
+  cols <- c("Order_Status", "Order_Lines", "New_Order_MRR", "Wave_Order_MRR", "Annual_Order_Rate", "Orders_Pct_Revenue")
+  sites <- sites %>% select(-any_of(cols))
+  if (is.null(op) || !nrow(sites)) {
+    return(sites %>% mutate(Order_Status = "Order data not loaded", Order_Lines = NA_integer_, New_Order_MRR = NA_real_,
+                            Wave_Order_MRR = NA_real_, Annual_Order_Rate = NA_real_, Orders_Pct_Revenue = NA_real_))
+  }
+  zero <- function(status, x, z) ifelse(status == "No orders in period", z, x)
+  sites %>% left_join(op$by_glm, by = "GLM_ID") %>%
+    mutate(Order_Status = case_when(!is.na(New_Order_MRR) ~ "Orders in period",
+                                    GLM_ID %in% op$glms_any_period ~ "No orders in period",
+                                    TRUE ~ "Not in order extract"),
+           Order_Lines = zero(Order_Status, Order_Lines, 0L),
+           New_Order_MRR = zero(Order_Status, New_Order_MRR, 0),
+           Wave_Order_MRR = zero(Order_Status, Wave_Order_MRR, 0),
+           Annual_Order_Rate = zero(Order_Status, Annual_Order_Rate, 0),
+           Orders_Pct_Revenue = ifelse(is.finite(Annual_Order_Rate) & is.finite(Total_MRR_12M) & Total_MRR_12M > 0,
+                                       Annual_Order_Rate / Total_MRR_12M, NA_real_))
+}
+
+training_label <- function(t) {
+  if (is.null(t) || t$mode == "all") "All eligible GLMs" else paste0("GLMs first billed ", t$year, " or later")
+}
+
+build_model_bundle <- function(file_path, sheet_name, progress_callback = NULL, training = list(mode = "all", year = 2019L)) {
   progress <- function(value, detail) {
     if (!is.null(progress_callback)) progress_callback(value, detail)
   }
   progress(0.03, "Reading on-net facility characteristics")
-  extension <- tolower(tools::file_ext(workbook_name))
-  if (!extension %in% c("xlsx", "xls")) {
-    stop("Upload an Excel workbook with a .xlsx or .xls extension.")
-  }
-  raw <- if (identical(extension, "xlsx")) {
-    read_xlsx(file_path, sheet = sheet_name, .name_repair = "minimal")
-  } else {
-    read_xls(file_path, sheet = sheet_name, .name_repair = "minimal")
-  }
+  raw <- read_excel(file_path, sheet = sheet_name, .name_repair = "minimal")
   if (anyNA(names(raw)) || any(!nzchar(names(raw))) || anyDuplicated(names(raw))) {
     stop("Workbook columns must have nonempty, unique headers.")
   }
@@ -540,6 +706,20 @@ build_model_bundle <- function(file_path, workbook_name, sheet_name, progress_ca
   duplicates <- sum(duplicated(profile$GLM_ID))
   profile <- profile %>% distinct(GLM_ID, .keep_all = TRUE)
   profile$Quote_Tokens <- lapply(profile$Quote_Raw, quote_tokens)
+  onnet_note <- NULL
+  profile$Onnet_Date <- tryCatch(parse_onnet_date(profile$onnet_date), error = function(e) {
+    onnet_note <<- paste("On-net dates could not be read and were ignored:", conditionMessage(e))
+    rep(as.Date(NA_character_, format = "%Y-%m-%d"), nrow(profile))
+  })
+  profile$Years_Onnet <- years_onnet(profile$Onnet_Date)
+  # dc_bill_date holds the first bill year (2019 onward); 0 or blank = first billed before 2019.
+  bill_year <- suppressWarnings(as.integer(clean_number(profile$dc_bill_date)))
+  profile$Bill_Year <- ifelse(is.finite(bill_year) & bill_year >= 1900 & bill_year <= 2100, bill_year, NA_integer_)
+  if (is.null(onnet_note)) {
+    raw_present <- !is.na(profile$onnet_date) & nzchar(trimws(as.character(profile$onnet_date)))
+    onnet_note <- paste0("On-net dates read for ", sum(!is.na(profile$Onnet_Date)), " of ", sum(raw_present),
+                         " on-net GLMs with a value in onnet_date.")
+  }
   profile$Count_Conflict <- with(profile,
                                  is.finite(derived_tenant_count) & is.finite(Unique_Billing_Customer_Count_12M) &
                                    Unique_Billing_Customer_Count_12M > derived_tenant_count)
@@ -556,7 +736,7 @@ build_model_bundle <- function(file_path, workbook_name, sheet_name, progress_ca
     )
   
   full_onnet <- profile
-  progress(0.12, "Calculating historical financials")
+  progress(0.12, "Calculating secondary historical financials")
   if (nrow(profile)) {
     financials <- lapply(seq_len(nrow(profile)), function(i) {
       f <- calculate_4mc_financials(profile$Year_Build[[i]], profile$SQ_foot[[i]], profile$CAPEX[[i]])
@@ -570,18 +750,28 @@ build_model_bundle <- function(file_path, workbook_name, sheet_name, progress_ca
   } else {
     for (name in c("Calculated_Historical_TAM_2030", "Calculated_Historical_TAM_10_Year",
                    "Calculated_Historical_Gross_Revenue_10_Year", "Calculated_Historical_SOM_10_Year",
-                   "Calculated_Historical_NPV", "Calculated_Historical_IRR", "Calculated_Historical_CAPEX")) {
+                   "Calculated_Historical_NPV", "Calculated_Historical_IRR", "Calculated_Historical_4MC_CAPEX")) {
       profile[[name]] <- numeric()
     }
   }
-  secondary <- train_secondary_model(profile, progress)
+  # Training set: all eligible GLMs, or only those first billed in/after the cutoff year (dc_bill_date).
+  training_profile <- if (!is.null(training) && training$mode == "after") {
+    profile %>% filter(!is.na(Bill_Year), Bill_Year >= training$year)
+  } else profile
+  secondary <- train_secondary_model(training_profile, progress)
+  secondary$training <- training
+  secondary$training_label <- training_label(training)
+  secondary$training_pool <- nrow(training_profile)
+  if (!is.null(training) && training$mode == "after")
+    secondary$model_message <- paste0(secondary$model_message, " Trained only on ", training_label(training), " (",
+                                      comma(nrow(training_profile)), " of ", comma(nrow(profile)), " eligible GLMs).")
   progress(1, "On-net profile ready")
   c(list(raw_rows = nrow(raw_source), onnet_rows = nrow(all_onnet),
          excluded_segment_rows = sum(!all_onnet$DC_Segments %in% valid_segments),
          duplicate_rows = duplicates, raw_source = raw_source,
          raw_glm_keys = clean_text(raw_source[[id_column]]), all_onnet_profile = all_onnet,
          full_onnet_profile = full_onnet, historical_profile = profile,
-         quote_catalogue = quote_catalogue(profile)), secondary)
+         quote_catalogue = quote_catalogue(profile), onnet_note = onnet_note), secondary)
 }
 
 # -----------------------------------------------------------------------------
@@ -621,11 +811,16 @@ select_comparables <- function(profile, new_dc) {
 
 size_adjusted_anchors <- function(sites, target_sqft) {
   
+  # size_ok <-
+  #   is.finite(sites$SQ_foot) &
+  #   sites$SQ_foot > 0 &
+  #   sites$SQ_foot >= 0.5 * target_sqft &
+  #   sites$SQ_foot <= 2 * target_sqft
+  # 
+  
   size_ok <-
     is.finite(sites$SQ_foot) &
-    sites$SQ_foot > 0 &
-    sites$SQ_foot >= 0.5 * target_sqft &
-    sites$SQ_foot <= 2 * target_sqft
+    sites$SQ_foot > 0
   
   revenue_ok <-
     size_ok &
@@ -701,6 +896,8 @@ size_adjusted_anchors <- function(sites, target_sqft) {
   trace <- tibble(
     GLM_ID = sites$GLM_ID,
     
+    Bill_Year = bill_year_text(sites$Bill_Year),
+    
     Square_Footage = sites$SQ_foot,
     
     Size_Within_0_5x_to_2x =
@@ -760,16 +957,36 @@ size_adjusted_anchors <- function(sites, target_sqft) {
       trace
   )
 }
-score_new_dc <- function(bundle, new_dc) {
+# Bill-year vintage filter for the comparison pool, from dc_bill_date in 'main'.
+# mode: "all"; "after" = first billed in or after the cutoff year; "before" = everything else
+# (first billed earlier; 0 / blank = first billed before 2019).
+vintage_default <- list(mode = "all", year = 2019L)
+bill_year_text <- function(x) {
+  if (is.null(x)) return(character())
+  ifelse(is.na(x), "Before 2019", as.character(x))
+}
+vintage_label <- function(v) {
+  if (is.null(v) || v$mode == "all") return("All GLMs (any bill year)")
+  if (v$mode == "after") paste0("First billed ", v$year, " or later") else paste0("First billed before ", v$year)
+}
+filter_vintage <- function(profile, v) {
+  if (is.null(v) || v$mode == "all" || !nrow(profile)) return(profile)
+  yr <- if ("Bill_Year" %in% names(profile)) profile$Bill_Year else rep(NA_integer_, nrow(profile))
+  newer <- !is.na(yr) & yr >= v$year
+  profile[if (v$mode == "after") newer else !newer, , drop = FALSE]
+}
+
+score_new_dc <- function(bundle, new_dc, vintage = vintage_default) {
   clean <- new_dc %>% mutate(Year_Build = parse_build_year(Year_Build),
-                             across(all_of(numeric_predictors), clean_number), state = toupper(clean_text(state)),
+                             across(all_of(unique(c(numeric_predictors, "CAPEX"))), clean_number), state = toupper(clean_text(state)),
                              city = toupper(clean_text(city)), urban_rural = toupper(clean_text(urban_rural)),
                              GLM_ID = clean_text(GLM_ID), DC_Segments = normalize_segment(DC_Segments))
   if (nrow(clean) != 1L || !clean$DC_Segments[[1]] %in% valid_segments) stop("Choose a valid segment 1-5.")
   if (!is.finite(clean$SQ_foot[[1]]) || clean$SQ_foot[[1]] <= 0) stop("Square footage must be greater than zero.")
   if (is.finite(clean$CAPEX[[1]]) && clean$CAPEX[[1]] < 0) stop("CAPEX input cannot be negative.")
   if (is.finite(clean$Capacity[[1]]) && clean$Capacity[[1]] < 0) stop("Capacity cannot be negative.")
-  matches <- select_comparables(bundle$historical_profile, clean)
+  pool <- filter_vintage(bundle$historical_profile, vintage)
+  matches <- select_comparables(pool, clean)
   sites <- matches$sites
   anchors <- size_adjusted_anchors(sites, clean$SQ_foot[[1]])
   predicted <- NA_real_
@@ -777,10 +994,8 @@ score_new_dc <- function(bundle, new_dc) {
   if (!is.null(bundle$model)) {
     unknown_levels <- categorical_predictors[vapply(categorical_predictors,
                                                     function(name) !clean[[name]][[1]] %in% bundle$encoder$levels[[name]], logical(1))]
-    predicted <- tryCatch(
-      as.numeric(pmax(expm1(predict_browser_model(bundle$model, encode_features(clean, bundle$encoder))), 0)),
-      error = function(e) NA_real_
-    )
+    predicted <- tryCatch(as.numeric(pmax(expm1(predict(bundle$model,
+                                                        xgboost::xgb.DMatrix(encode_features(clean, bundle$encoder)))), 0)), error = function(e) NA_real_)
   }
   errors <- sites %>% left_join(bundle$historical_scores, by = "GLM_ID") %>%
     mutate(Error_Pct = abs(Actual_Revenue - Predicted_Revenue) / pmax(Actual_Revenue, 1))
@@ -792,7 +1007,9 @@ score_new_dc <- function(bundle, new_dc) {
        matched_raw = bundle$raw_source[source_rows, , drop = FALSE],
        comparable_scope = matches$scope,
        comparable_scope_counts = matches$scope_counts, comparable_candidate_count = matches$candidate_count,
-       comparable_total = nrow(sites), anchors = anchors, quote_catalogue = quote_catalogue(sites),
+       comparable_total = nrow(sites), anchors = anchors,
+       vintage = vintage, vintage_label = vintage_label(vintage), vintage_pool = nrow(pool),
+       vintage_portfolio = nrow(bundle$historical_profile), quote_catalogue = quote_catalogue(sites),
        predicted_revenue = predicted, unknown_model_levels = unknown_levels, similar_glm_pct_error = error,
        error_sample = sum(is.finite(errors$Error_Pct)),
        heuristic_low = if (is.finite(error)) max(predicted * (1 - error), 0) else NA_real_,
@@ -809,7 +1026,233 @@ input_number <- function(x) {
   suppressWarnings(as.numeric(x))
 }
 
+# -----------------------------------------------------------------------------
+# Percentile helpers, on-net dates
+# -----------------------------------------------------------------------------
+percentile_within <- function(x) {
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  if (sum(ok) >= 2) out[ok] <- ecdf(x[ok])(x[ok])
+  out
+}
+
+percentile_of <- function(reference, value) {
+  if (length(value) != 1L || !is.finite(value)) return(NA_real_)
+  safe_percentile(reference, value)
+}
+
+revenue_window_end <- as.Date("2026-07-31", format = "%Y-%m-%d")
+
+# Reads onnet_date whatever form Excel/readxl delivers it in. Every conversion uses an explicit
+# format, and anything unreadable becomes NA instead of stopping the workbook load.
+onnet_min_date <- as.Date("1950-01-01", format = "%Y-%m-%d")
+onnet_max_date <- as.Date("2100-12-31", format = "%Y-%m-%d")
+
+parse_onnet_date <- function(x) {
+  n <- length(x)
+  empty <- function(k) rep(as.Date(NA_character_, format = "%Y-%m-%d"), k)
+  clamp <- function(d) {
+    d[!is.na(d) & (d < onnet_min_date | d > onnet_max_date)] <- NA
+    d
+  }
+  safe_date <- function(text, fmt) {
+    d <- tryCatch(suppressWarnings(as.Date(as.character(text), format = fmt)),
+                  error = function(e) empty(length(text)))
+    clamp(d)
+  }
+  from_number <- function(v) {
+    v <- suppressWarnings(as.numeric(v))
+    out <- empty(length(v))
+    serial <- is.finite(v) & v > 18000 & v < 80000                  # Excel serial date
+    if (any(serial)) out[serial] <- as.Date(floor(v[serial]), origin = as.Date("1899-12-30", format = "%Y-%m-%d"))
+    year <- is.finite(v) & v >= 1950 & v <= 2100                    # year only -> 1 July
+    if (any(year)) out[year] <- safe_date(sprintf("%04d-07-01", as.integer(floor(v[year]))), "%Y-%m-%d")
+    ymd <- is.finite(v) & v >= 19500101 & v <= 21001231             # yyyymmdd number
+    if (any(ymd)) out[ymd] <- safe_date(sprintf("%08.0f", floor(v[ymd])), "%Y%m%d")
+    clamp(out)
+  }
+  if (!n) return(empty(0))
+  if (inherits(x, "Date")) return(clamp(x))
+  if (inherits(x, "POSIXt")) return(clamp(as.Date(format(x, "%Y-%m-%d"), format = "%Y-%m-%d")))
+  if (is.numeric(x)) return(from_number(x))
+  text <- trimws(as.character(x))
+  text[is.na(text) | text %in% c("", "NA", "N/A", "#N/A", "NULL", "-", "NF")] <- NA_character_
+  out <- empty(n)
+  for (fmt in c("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%b %d, %Y", "%B %d, %Y", "%m-%d-%Y", "%m/%d/%y", "%d-%b-%y")) {
+    todo <- is.na(out) & !is.na(text)
+    if (!any(todo)) break
+    out[todo] <- safe_date(text[todo], fmt)
+  }
+  todo <- is.na(out) & !is.na(text) & grepl("^[0-9]+(\\.[0-9]+)?$", text)
+  if (any(todo)) out[todo] <- from_number(text[todo])
+  out
+}
+
+years_onnet <- function(onnet_date) {
+  y <- as.numeric(revenue_window_end - onnet_date) / 365.25
+  y[!is.finite(y)] <- NA_real_
+  pmax(y, 0)
+}
+
+# -----------------------------------------------------------------------------
+# Unified performer classes (v5.9) — ONE system used everywhere in the app.
+# Every eligible site is ranked by annual revenue within its own segment across the whole
+# portfolio. Top tier_pct% = High, bottom tier_pct% = Low, the middle = Medium. The proposed
+# site's predicted revenue is placed against the same segment limits. The Medium average of
+# the matched sites is the Overview benchmark (a symmetric trimmed comparison).
+# -----------------------------------------------------------------------------
+tier_pct_default <- 10
+class_levels <- c("High", "Medium", "Low", "Unclassified")
+class_colors <- c(High = "#d1fae5", Medium = "#f2f4f7", Low = "#fee4e2", Unclassified = "#ffffff")
+class_point_colors <- c(High = "#12b76a", Medium = "#0f6cbd", Low = "#f04438", Unclassified = "#98a2b3", Proposed = "#7f56d9")
+
+tier_of <- function(revenue, lower, upper) {
+  ifelse(!is.finite(revenue) | revenue <= 0, "Unclassified",
+         ifelse(is.finite(upper) & revenue > upper, "High",
+                ifelse(is.finite(lower) & revenue < lower, "Low", "Medium")))
+}
+
+revenue_tier_table <- function(profile, pct = tier_pct_default) {
+  p <- pct / 100
+  if (!"Years_Onnet" %in% names(profile)) profile$Years_Onnet <- NA_real_
+  profile %>%
+    mutate(Revenue = Total_MRR_12M,
+           Rev_per_SQFT = ifelse(is.finite(SQ_foot) & SQ_foot > 0, Revenue / SQ_foot, NA_real_),
+           Rev_per_MW = ifelse(is.finite(Capacity) & Capacity > 0, Revenue / Capacity, NA_real_)) %>%
+    group_by(DC_Segments) %>%
+    mutate(Segment_Sites = sum(is.finite(Revenue)),
+           Lower = if (sum(is.finite(Revenue)) >= 3L) stats::quantile(Revenue, p, na.rm = TRUE, names = FALSE) else NA_real_,
+           Upper = if (sum(is.finite(Revenue)) >= 3L) stats::quantile(Revenue, 1 - p, na.rm = TRUE, names = FALSE) else NA_real_,
+           Segment_Rank = min_rank(desc(Revenue)),
+           Revenue_Percentile = percentile_within(Revenue),
+           P_Rev_SQFT = percentile_within(Rev_per_SQFT),
+           P_Rev_MW = percentile_within(Rev_per_MW)) %>%
+    group_by(state) %>%
+    mutate(State_Rank = min_rank(desc(Revenue)), State_Sites = sum(is.finite(Revenue))) %>%
+    ungroup() %>%
+    mutate(Tier = factor(tier_of(Revenue, Lower, Upper), levels = class_levels))
+}
+
+proposed_tier <- function(r, tiers) {
+  inp <- r$input
+  seg <- inp$DC_Segments[[1]]
+  pool <- tiers %>% filter(DC_Segments == seg)
+  rev <- r$predicted_revenue
+  sq <- inp$SQ_foot[[1]]
+  cap <- inp$Capacity[[1]]
+  rps <- if (is.finite(rev) && is.finite(sq) && sq > 0) rev / sq else NA_real_
+  rpm <- if (is.finite(rev) && is.finite(cap) && cap > 0) rev / cap else NA_real_
+  lower <- if (nrow(pool)) pool$Lower[[1]] else NA_real_
+  upper <- if (nrow(pool)) pool$Upper[[1]] else NA_real_
+  list(segment = seg, revenue = rev, rev_per_sqft = rps, rev_per_mw = rpm,
+       percentile = percentile_of(pool$Revenue, rev),
+       p_rev_sqft = percentile_of(pool$Rev_per_SQFT, rps), p_rev_mw = percentile_of(pool$Rev_per_MW, rpm),
+       segment_rank = if (is.finite(rev)) safe_rank(pool$Revenue, rev) else NA_integer_,
+       segment_n = sum(is.finite(pool$Revenue)),
+       lower = lower, upper = upper,
+       tier = if (is.finite(rev)) tier_of(rev, lower, upper) else NA_character_)
+}
+
+# Model example sites, ranked by model similarity: the share of the model's trees in which
+# the historical GLM ends up in the same final group (leaf) as the proposed site.
+model_influence <- function(b, r, perf, top_n = 5, same_segment_only = FALSE) {
+  unavailable <- function(msg) list(available = FALSE, message = msg, top = tibble(), all = tibble())
+  if (is.null(b$model) || !requireNamespace("xgboost", quietly = TRUE)) return(unavailable(b$model_message))
+  tryCatch({
+    train_df <- b$historical_profile[match(b$historical_scores$GLM_ID, b$historical_profile$GLM_ID), , drop = FALSE]
+    x_hist <- encode_features(train_df, b$encoder)
+    x_new <- encode_features(r$input, b$encoder)
+    leaves_hist <- predict(b$model, xgboost::xgb.DMatrix(x_hist), predleaf = TRUE)
+    leaves_new <- predict(b$model, xgboost::xgb.DMatrix(x_new), predleaf = TRUE)
+    if (is.null(dim(leaves_hist))) leaves_hist <- matrix(leaves_hist, nrow = nrow(x_hist))
+    leaves_new <- as.vector(leaves_new)
+    if (ncol(leaves_hist) != length(leaves_new)) stop("Tree leaf output has an unexpected shape.")
+    shared <- sweep(leaves_hist, 2, leaves_new, `==`) * 1
+    leaf_size <- colSums(shared)
+    per_tree <- sweep(shared, 2, pmax(leaf_size, 1), `/`)
+    influence <- rowSums(per_tree) / sum(leaf_size > 0)
+    all <- tibble(GLM_ID = train_df$GLM_ID, Influence_Share = influence, Model_Similarity = rowMeans(shared))
+    if (isTRUE(same_segment_only)) {
+      keep <- train_df$DC_Segments == r$input$DC_Segments[[1]]
+      all <- all[keep, , drop = FALSE]
+      all$Influence_Share <- all$Influence_Share / sum(all$Influence_Share)
+    }
+    inp <- r$input
+    all <- all %>%
+      left_join(perf %>% select(GLM_ID, DC_Operator, city, state, DC_Segments, SQ_foot, Capacity, urban_rural,
+                                Year_Build, Bill_Year, Revenue, Rev_per_SQFT, Rev_per_MW, Revenue_Percentile, Tier), by = "GLM_ID") %>%
+      arrange(desc(Model_Similarity), desc(Influence_Share), GLM_ID) %>%
+      mutate(Influence_Rank = row_number(),
+             In_Matched_25 = GLM_ID %in% r$comparable_facilities$GLM_ID,
+             Size_vs_Proposed = ifelse(is.finite(SQ_foot) & is.finite(inp$SQ_foot[[1]]), SQ_foot / inp$SQ_foot[[1]], NA_real_),
+             Power_vs_Proposed = ifelse(is.finite(Capacity) & is.finite(inp$Capacity[[1]]) & inp$Capacity[[1]] > 0,
+                                        Capacity / inp$Capacity[[1]], NA_real_),
+             Why_Similar = mapply(function(cty, st, seg, ur, sz, pw) {
+               flags <- c(if (identical(st, inp$state[[1]])) "same state",
+                          if (identical(st, inp$state[[1]]) && identical(cty, inp$city[[1]])) "same city",
+                          if (identical(seg, inp$DC_Segments[[1]])) "same segment",
+                          if (identical(ur, inp$urban_rural[[1]])) "same urban/rural",
+                          if (is.finite(sz)) paste0(round(sz, 2), "× size"),
+                          if (is.finite(pw)) paste0(round(pw, 2), "× power"))
+               paste(flags, collapse = ", ")
+             }, city, state, DC_Segments, urban_rural, Size_vs_Proposed, Power_vs_Proposed, USE.NAMES = FALSE))
+    top <- head(all, top_n)
+    list(available = TRUE, message = NULL, all = all, top = top,
+         top_share = sum(top$Influence_Share), top_similarity = safe_mean(top$Model_Similarity),
+         top_median_revenue = safe_median(top$Revenue), trees = sum(leaf_size > 0),
+         sites = nrow(all))
+  }, error = function(e) unavailable(paste("Model example sites unavailable:", conditionMessage(e))))
+}
+
+# What drove the prediction: the model's own per-input contributions (SHAP values),
+# grouped back to the original inputs and shown as multipliers on a typical site.
+prediction_breakdown <- function(b, r) {
+  unavailable <- function(msg) list(available = FALSE, message = msg, table = tibble())
+  if (is.null(b$model) || !requireNamespace("xgboost", quietly = TRUE)) return(unavailable(b$model_message))
+  tryCatch({
+    inp <- r$input
+    x_new <- encode_features(inp, b$encoder)
+    contrib <- predict(b$model, xgboost::xgb.DMatrix(x_new), predcontrib = TRUE)
+    contrib_names <- colnames(contrib)
+    if (is.null(contrib_names)) contrib_names <- c(colnames(x_new), "BIAS")
+    contrib <- matrix(as.numeric(contrib), nrow = 1, dimnames = list(NULL, contrib_names))
+    cols <- colnames(contrib)
+    bias_col <- if (any(cols %in% c("BIAS", "(Intercept)"))) which(cols %in% c("BIAS", "(Intercept)"))[[1]] else length(cols)
+    bias <- contrib[1, bias_col]
+    effects <- contrib[1, -bias_col]
+    feature <- vapply(names(effects), function(col) {
+      if (col %in% numeric_predictors) return(col)
+      for (name in categorical_predictors) if (startsWith(col, paste0(make.names(name), "_"))) return(name)
+      "Other"
+    }, character(1))
+    grouped <- tapply(effects, feature, sum)
+    unseen <- r$unknown_model_levels
+    value_label <- function(f) {
+      v <- switch(f,
+                  state = paste("State:", inp$state[[1]]), city = paste("City:", inp$city[[1]]),
+                  urban_rural = paste("Urban / rural:", inp$urban_rural[[1]]),
+                  DC_Segments = paste("Segment:", inp$DC_Segments[[1]]),
+                  SQ_foot = paste("Size:", comma(inp$SQ_foot[[1]]), "sqft"),
+                  Capacity = paste("Power:", if (is.finite(inp$Capacity[[1]])) comma(inp$Capacity[[1]], accuracy = 0.1) else "missing", "MW"),
+                  CAPEX = paste("CAPEX:", fmt_dollar(inp$CAPEX[[1]])), f)
+      if (f %in% unseen) paste(v, "(not seen in training)") else v
+    }
+    tab <- tibble(Feature = names(grouped), Effect_Log = as.numeric(grouped)) %>%
+      mutate(Driver = vapply(Feature, value_label, character(1)), Multiplier = exp(Effect_Log)) %>%
+      arrange(desc(abs(Effect_Log)))
+    level <- exp(bias) * cumprod(tab$Multiplier)
+    tab$Dollar_Change <- diff(c(exp(bias), level))
+    tab$Running_Total <- level - 1
+    list(available = TRUE, message = NULL, baseline = expm1(bias), prediction = max(expm1(bias + sum(effects)), 0),
+         table = tab)
+  }, error = function(e) unavailable(paste("Prediction breakdown unavailable:", conditionMessage(e))))
+}
+
 # Presentation helpers: native details stay closed until explicitly expanded.
+html_metric_card <- function(title, output_id, class_name = "") {
+  div(class = paste("metric-card", class_name), div(class = "metric-title", title), uiOutput(output_id))
+}
+
 metric_card <- function(title, output_id, subtitle = NULL, class_name = "") {
   div(class = paste("metric-card", class_name), div(class = "metric-title", title),
       div(class = "metric-value", textOutput(output_id, inline = TRUE)),
@@ -861,7 +1304,7 @@ ui <- fluidPage(
       .positioning-panel {background:linear-gradient(135deg,#f8fafc,#eef4fb);border:1px solid #d8e4f0;border-radius:12px;padding:18px;margin-top:18px;}
       .positioning-grid,.growth-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px;}
       .growth-panel {background:#fff;border:1px solid #d8e4f0;border-radius:12px;padding:18px;margin-top:18px;}
-      .growth-grid {grid-template-columns:repeat(4,minmax(0,1fr));}
+      .growth-grid {grid-template-columns:repeat(6,minmax(0,1fr));}
       .growth-assumptions {background:#f8fafc;border:1px solid #e4e7ec;border-radius:10px;padding:14px;margin:14px 0;}
       .scenario-buttons .radio-inline {background:#fff;border:1px solid #d0d5dd;border-radius:8px;padding:10px 14px 10px 34px;margin:4px 8px 4px 0;font-weight:650;}
       .scenario-buttons .radio-inline:has(input:checked) {background:#f4f0ff;border-color:#7f56d9;color:#6941c6;}
@@ -898,6 +1341,65 @@ ui <- fluidPage(
       .range-card {border-left-color:#0f6cbd;background:linear-gradient(135deg,#fff,#eef6ff);}
       .comparable-card {border-left-color:#12b76a;background:linear-gradient(135deg,#fff,#ecfdf3);}
       .finance-card {border-left-color:#f79009;background:linear-gradient(135deg,#fff,#fffaeb);}
+      .class-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:16px 0;}
+      .class-tile {min-width:0;background:#fff;border:1px solid #eaecf0;border-top:5px solid #98a2b3;border-radius:12px;padding:16px 18px;box-shadow:0 1px 4px rgba(16,24,40,.08);}
+      .class-tile.high {border-top-color:#12b76a;background:linear-gradient(180deg,#ecfdf3,#fff 70%);}
+      .class-tile.medium {border-top-color:#0f6cbd;background:linear-gradient(180deg,#eef6ff,#fff 70%);}
+      .class-tile.low {border-top-color:#f04438;background:linear-gradient(180deg,#fef3f2,#fff 70%);}
+      .class-tile-head {display:flex;justify-content:space-between;align-items:baseline;gap:10px;}
+      .class-label {color:#344054;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;}
+      .class-count {color:#101828;font-size:30px;font-weight:800;line-height:1.1;}
+      .class-count small {color:#667085;font-size:13px;font-weight:600;margin-left:4px;}
+      .class-rule {color:#475467;font-size:13px;font-weight:600;margin-top:8px;}
+      .class-role {color:#667085;font-size:12px;margin-top:4px;}
+      .benchmark-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:6px 0 16px;}
+      .benchmark-card {min-width:0;background:#f9fafb;border:1px solid #eaecf0;border-radius:12px;padding:16px 18px;}
+      .benchmark-card.primary {background:linear-gradient(135deg,#fff,#eef6ff);border-color:#b2ddff;}
+      .benchmark-card.proposed {background:linear-gradient(135deg,#fff,#f4f0ff);border-color:#d9d6fe;}
+      .benchmark-value {color:#101828;font-size:24px;font-weight:800;line-height:1.2;margin-top:6px;overflow-wrap:anywhere;}
+      .benchmark-sub {color:#667085;font-size:12px;line-height:1.5;margin-top:6px;}
+      .subsection-title {color:#344054;font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;}
+      .class-badge {display:inline-block;border-radius:999px;padding:3px 10px;font-size:12px;font-weight:800;}
+      .class-badge.high {background:#d1fadf;color:#05603a;}
+      .class-badge.low {background:#fee4e2;color:#912018;}
+      .class-badge.medium {background:#d1e9ff;color:#175cd3;}
+      .positioning-grid.three {grid-template-columns:repeat(3,minmax(0,1fr));}
+      .driver-headline {color:#101828;font-size:19px;font-weight:800;line-height:1.3;margin-top:8px;overflow-wrap:anywhere;}
+      .driver-sub {color:#667085;font-size:12px;margin-top:6px;}
+      .driver-mult {display:inline-block;border-radius:999px;padding:2px 9px;font-size:13px;font-weight:800;margin-right:6px;}
+      .driver-mult.up {background:#d1fadf;color:#05603a;}
+      .driver-mult.down {background:#fee4e2;color:#912018;}
+      .driver-flow {display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;margin:6px 0 14px;}
+      .flow-step {min-width:130px;max-width:220px;border:1px solid #eaecf0;border-radius:12px;padding:10px 12px;background:#fff;box-shadow:0 1px 3px rgba(16,24,40,.06);}
+      .flow-step.start {background:#f2f4f7;}
+      .flow-step.up {background:#ecfdf3;border-color:#abefc6;}
+      .flow-step.down {background:#fef3f2;border-color:#fecdca;}
+      .flow-step.end {background:#f4f0ff;border-color:#d9d6fe;}
+      .flow-label {color:#667085;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;}
+      .flow-value {color:#101828;font-size:15px;font-weight:800;margin-top:3px;overflow-wrap:anywhere;}
+      .flow-delta {font-size:12px;font-weight:700;margin-top:4px;}
+      .flow-step.up .flow-delta {color:#067647;}
+      .flow-step.down .flow-delta {color:#b42318;}
+      .flow-total {color:#667085;font-size:11px;margin-top:2px;}
+      .flow-flag {color:#b54708;font-size:11px;font-weight:700;margin-top:3px;}
+      .flow-arrow {align-self:center;color:#98a2b3;font-size:18px;font-weight:800;}
+      .mini-compare {display:flex;flex-wrap:wrap;gap:4px 18px;font-size:12px;color:#475467;background:#f9fafb;border:1px dashed #d0d5dd;border-radius:10px;padding:8px 12px;margin:2px 0 4px;}
+      .mini-compare strong {color:#344054;}
+      .mini-compare .mc-title {font-weight:800;color:#344054;text-transform:uppercase;letter-spacing:.04em;font-size:11px;}
+      .sanity-line {background:#f8fafc;border:1px solid #dfe7ef;border-radius:10px;padding:10px 14px;margin:10px 0;font-size:13px;color:#344054;}
+      .toggle-bar {display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;margin:6px 0 2px;}
+      .toggle-bar .checkbox {margin:0;}
+      .toggle-bar .form-group {margin-bottom:0;}
+      .status-pill {display:inline-block;border-radius:999px;background:#eef4fb;color:#175cd3;padding:3px 10px;font-size:12px;font-weight:700;}
+      .rule-bar {background:#f8fafc;border:1px solid #dfe7ef;border-radius:12px;padding:12px 16px 4px;margin:10px 0 6px;}
+      .rule-bar-title {color:#344054;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px;}
+      .rule-bar .radio {margin:2px 0;}
+      .rule-bar .form-group {margin-bottom:8px;}
+      .peer-method {background:#f8fafc;border:1px solid #dfe7ef;border-radius:12px;padding:16px 18px;margin:12px 0;}
+      .peer-method ol {margin:8px 0 0;padding-left:20px;color:#475467;font-size:13px;}
+      .peer-method li {margin-bottom:4px;}
+      .criteria-chip {display:inline-block;background:#fff;border:1px solid #d0d5dd;border-radius:999px;padding:4px 11px;margin:3px 6px 3px 0;font-size:12px;font-weight:700;color:#344054;}
+      .peer-detail {background:#fff;border:1px solid #eaecf0;border-radius:12px;padding:16px 18px;margin-top:12px;}
       .scope-badge {display:inline-block;border-radius:999px;background:#e8f1fb;color:#0f548c;padding:6px 11px;font-weight:700;font-size:12px;overflow-wrap:anywhere;}
       .user-input-header {display:flex;justify-content:space-between;align-items:flex-start;gap:18px;padding-bottom:14px;border-bottom:1px solid #eaecf0;}
       .user-input-id {color:#101828;font-size:24px;font-weight:800;line-height:1.25;overflow-wrap:anywhere;}
@@ -936,7 +1438,7 @@ ui <- fluidPage(
       table.dataTable tbody tr:hover {background:#f4f7fb;}
       table.dataTable thead .form-control {color:#1f2937;background:#fff;}
       .compact-table-wrap {max-width:100%;min-width:0;overflow-x:auto;-webkit-overflow-scrolling:touch;}
-      #comparable_compact table.dataTable {width:100% !important;min-width:1500px;table-layout:fixed;font-size:12px;}
+      #comparable_compact table.dataTable {width:100% !important;min-width:1800px;table-layout:fixed;font-size:12px;}
       #comparable_compact table.dataTable th,#comparable_compact table.dataTable td {white-space:normal;overflow-wrap:anywhere;padding:10px 8px;}
       .dataTables_wrapper {min-width:0;font-size:12px;}
       .dataTables_wrapper .dataTables_filter {margin-bottom:12px;}
@@ -949,7 +1451,7 @@ ui <- fluidPage(
       .skip-link {position:absolute;left:24px;top:-100px;background:#fff;color:#6941c6;padding:10px 14px;border-radius:8px;z-index:1000;}
       .skip-link:focus {top:8px;}
       @media(min-width:1600px) {.app-shell {padding:28px 32px;} .app-layout {grid-template-columns:340px minmax(0,1fr);gap:28px;}}
-      @media(max-width:1399px) {.customer-metric-grid {grid-template-columns:repeat(2,minmax(0,1fr));}}
+      @media(max-width:1399px) {.customer-metric-grid {grid-template-columns:repeat(2,minmax(0,1fr));} .growth-grid {grid-template-columns:repeat(3,minmax(0,1fr));}}
       @media(max-width:1199px) and (min-width:1100px) {.user-input-grid {grid-template-columns:repeat(2,minmax(0,1fr));} .metric-card {padding:14px;} .metric-value {font-size:24px;}}
       @media(max-width:1099px) {
         .app-layout {grid-template-columns:minmax(0,1fr);gap:18px;}
@@ -974,7 +1476,7 @@ ui <- fluidPage(
         .user-input-header {flex-wrap:wrap;gap:10px;}
         .nav-tabs > li {flex:1 1 calc(50% - 6px);text-align:center;}
         .nav-tabs > li > a {padding:10px 8px;font-size:12px;}
-        .matching-summary ul,.positioning-grid,.growth-grid {grid-template-columns:1fr;}
+        .matching-summary ul,.positioning-grid,.positioning-grid.three,.growth-grid,.class-grid,.benchmark-grid {grid-template-columns:1fr;}
       }
       @media(max-width:399px) {
         .app-shell {padding:12px;}
@@ -1032,11 +1534,20 @@ ui <- fluidPage(
       tags$aside(class = "sidebar-panel", `aria-label` = "Workbook and proposed-site inputs",
                  div(class = "sidebar-section",
                      h4(class = "sidebar-section-title", "01 / Workbook"),
-                     fileInput("model_file", "Modeling workbook", accept = c(".xlsx", ".xls"), placeholder = workbook_placeholder),
-                     p(class = "sidebar-note", "The workbook is processed only in this browser session and is not part of the published site."),
+                     fileInput("model_file", "Modeling workbook", accept = c(".xlsx", ".xls"), placeholder = default_file_path),
                      textInput("sheet_name", "Sheet", default_sheet_name),
+                     selectInput("train_set", "Train model on",
+                                 c("All eligible GLMs" = "all", "GLMs first billed in / after cutoff year" = "after"), "all"),
+                     conditionalPanel("input.train_set === 'after'",
+                                      numericInput("train_cutoff", "Training cutoff bill year", 2019, min = 2019, max = 2026, step = 1)),
+                     uiOutput("train_set_note"),
                      actionButton("load_model", "Load workbook", class = "btn-primary"),
-                     uiOutput("load_status")),
+                     uiOutput("load_status"),
+                     tags$hr(),
+                     fileInput("order_file", "Order data (optional)", accept = c(".xlsx", ".xls", ".csv"), placeholder = default_order_file_path),
+                     textInput("order_sheet_name", "Order sheet", default_order_sheet_name),
+                     actionButton("load_orders", "Load order data", class = "btn-default"),
+                     uiOutput("order_status")),
                  div(class = "sidebar-section",
                      h4(class = "sidebar-section-title", "02 / Proposed site"),
                      textInput("glm_id", "GLM ID", "NEW_TX_DC"),
@@ -1046,64 +1557,73 @@ ui <- fluidPage(
                      selectInput("dc_segment", "Segment", paste("Segment", 1:5), "Segment 2"),
                      numericInput("capacity", "Capacity (MW)", 30, min = 0),
                      selectInput("urban_rural", "Urban / rural", c("URBAN", "URBAN AREA", "RURAL", "UNKNOWN"), "URBAN"),
-                     numericInput("capex", "CAPEX ($; financials / revenue model only)", 500000, min = 0),
+                     numericInput("capex", "CAPEX ($; Financials only)", 500000, min = 0),
+                     selectInput("onnet_vintage", "Compare against GLMs (dc_bill_date)",
+                                 c("All GLMs" = "all", "First billed in / after cutoff year" = "after", "First billed before cutoff year" = "before"), "all"),
+                     conditionalPanel("input.onnet_vintage !== 'all'",
+                                      numericInput("onnet_cutoff", "Cutoff bill year", 2019, min = 2019, max = 2026, step = 1)),
+                     uiOutput("vintage_pool_note"),
                      actionButton("score_dc", "Match proposed site", class = "btn-success"),
-                     p(class = "sidebar-note", "Re-match after changing inputs. CAPEX does not affect matching."))
+                     p(class = "sidebar-note", "Re-match after changing inputs. CAPEX affects the Financials tab only, not matching or predicted revenue. The bill-year filter changes which GLMs are compared, not the predicted revenue or class limits."))
       ),
       tags$main(id = "main-content", class = "main-content", tabindex = "-1", tabsetPanel(
         tabPanel("Overview",
                  div(class="section-panel",section_heading("Comparable Datacenter Profile","HISTORICAL BENCHMARKS"),
                      uiOutput("loaded_workbook_context"),uiOutput("comparable_scope"),uiOutput("matching_explanation"),uiOutput("match_warnings"),
                      p(class="context-note","The metrics below summarize similar valid on-net data centers identified as the closest matches to the proposed site. These values provide historical context and are not predictions."),
+                     div(class="toggle-bar",
+                         checkboxInput("exclude_outliers", "Exclude High / Low sites from the averages and estimates", TRUE),
+                         uiOutput("comparison_status", inline = TRUE)),
                      div(class="metric-grid customer-metric-grid",
                          metric_card(
                            "Average DC tenants",
                            "average_tenants",
-                           "Typical tenant count among similar on-net data centers.",
+                           "Average across the matched sites in use (see toggle above).",
                            "hero-card"
                          ),
                          
                          metric_card(
                            "Average billed customers",
                            "average_customers",
-                           "Typical customer count among similar on-net data centers.",
+                           "Average across the matched sites in use (see toggle above).",
                            "comparable-card"
                          ),
                          
                          metric_card(
                            "Average annual revenue",
                            "average_revenue",
-                           "Typical annual revenue (all products) among similar on-net data centers.",
+                           "Across the matched sites in use (see toggle above).",
                            "range-card"
                          ),
                          
                          metric_card(
                            "Observed revenue range",
                            "historical_revenue_range",
-                           "Revenue range observed across similar on-net data centers.",
+                           "Across the matched sites in use (see toggle above).",
                            "range-card"
-                         ))),
+                         )),
+                     uiOutput("performer_benchmark_note")),
                  div(class="section-panel",section_heading("Projected Datacenter Metrics","PROPOSED Datacenter OUTLOOK"),
                      
                      div(class="metric-grid customer-metric-grid",
                          metric_card(
                            "Estimated DC tenants",
                            "overview_estimated_tenants",
-                           "Expected tenant count for the proposed site.",
+                           "Size-scaled from the matched sites in use.",
                            "hero-card"
                          ),
                          
                          metric_card(
                            "Estimated billed customers",
                            "overview_estimated_customers",
-                           "Expected customer count for the proposed site.",
+                           "Estimated tenants × customer penetration of the matched sites in use.",
                            "comparable-card"
                          ),
                          
                          metric_card(
                            "Predicted annual revenue",
                            "overview_predicted_revenue",
-                           "Expected annual revenue based on similar on-net data centers.",
+                           "Model estimate of annual revenue for the inputs entered for this proposed DC.",
                            "range-card"
                          ),
                          
@@ -1113,9 +1633,31 @@ ui <- fluidPage(
                            "Likely revenue range based on similar on-net data centers.",
                            "range-card"
                          )),
-                     
+                     uiOutput("projected_compare"),
+                     div(class="toggle-bar", checkboxInput("show_comp_revenue", "Show comparison with the matched sites (inputs and revenue per customer)", FALSE)),
+                     conditionalPanel("input.show_comp_revenue",
+                         div(class="subsection-title","Proposed site inputs vs the matched sites"),
+                         DTOutput("input_compare_table"),
+                         p(class="context-note","Effect on prediction = how much that input moves the model's predicted revenue (from the Model explanation tab): below 1.00× lowers it, above 1.00× raises it."),
+                         div(class="subsection-title","Revenue per billed customer"),
+                         div(class="metric-grid",
+                             metric_card("Matched sites earn per customer", "comp_rev_per_customer", "Total revenue ÷ total billed customers of the matched sites in use.", "comparable-card"),
+                             metric_card("Model implies per customer", "model_rev_per_customer", "Predicted revenue ÷ estimated billed customers.", "hero-card"),
+                             metric_card("Comparables-based revenue", "comp_revenue", "Estimated billed customers × what the matched sites earn per customer.", "range-card")),
+                         uiOutput("comp_revenue_note"))),
+                 div(class="section-panel",section_heading("Outlier-Adjusted Benchmark","PROPOSED SITE VS MEDIUM PERFORMERS"),
+                     p(class="context-note","One system across the app: every site is classed High, Medium or Low by its annual revenue within its segment across the whole portfolio. Matched High and Low sites are left out of the benchmark; Medium sites are the like-for-like comparison for the proposed site."),
+                     div(class="rule-bar",
+                         div(class="rule-bar-title","Class limits"),
+                         fluidRow(column(4, numericInput("tier_pct", "High / Low = top & bottom % of segment", tier_pct_default, min = 1, max = 33, step = 1))),
+                         uiOutput("rule_bar_note")),
+                     uiOutput("performer_overview"),
+                     details_panel("Matched data centers by performer class", DTOutput("performer_class_table")),
+                     details_panel("How the comparison group was selected and classified", uiOutput("performer_method_note"))),
+                 div(class="section-panel",section_heading("Positioning & Growth Outlook","PROPOSED SITE IN CONTEXT"),
                      div(class="positioning-panel",section_heading("DC positioning","Predicted revenue compared with similar on-net data centers"),
-                         div(class="positioning-grid",
+                         div(class="positioning-grid three",
+                             metric_card("Predicted performer class","position_predicted_class","Predicted revenue against the segment class limits.","hero-card"),
                              metric_card("Revenue rank vs matched GLMs","position_revenue_rank_matched","Predicted revenue versus selected matches.","comparable-card"),
                              metric_card("Revenue rank vs historical portfolio","position_revenue_rank_portfolio","Predicted revenue versus all eligible historical GLMs.","range-card")),
                          uiOutput("positioning_context"),
@@ -1123,33 +1665,97 @@ ui <- fluidPage(
                                   column(6,div(style="padding-top:25px;",actionButton("show_revenue_peers","View Revenue Peers",class="btn-primary")))),
                          conditionalPanel("input.show_revenue_peers % 2 === 1",div(class="details-panel",div(class="details-body",h4("Revenue peers around the proposed site"),DTOutput("revenue_peers_table"))))),
                      div(class="growth-panel",section_heading("Future bandwidth growth opportunity","Greater demand and service consumption over time"),
-                         p(class="context-note","This scenario starts with current predicted annual revenue and estimates how the opportunity could expand as bandwidth demand grows. It does not assume additional billed customers or a specific future product mix."),
-                         div(class="scenario-buttons",
-                             radioButtons("growth_scenario","Planning scenario",
-                                          choices=c("No Growth"="no_growth","Demand Grows, Revenue Doesn't"="demand_no_revenue","Partial Monetization"="partial","Full Monetization"="full"),
-                                          selected="partial",inline=TRUE)),
-                         uiOutput("growth_scenario_description"),
-                         div(class="growth-assumptions",fluidRow(
-                           column(4,numericInput("growth_horizon_years","Forecast horizon (years)",5,min=1,max=10,step=1)),
-                           column(4,numericInput("bandwidth_growth_rate","Annual bandwidth-demand growth (%)",10,min=0,max=100,step=1)),
-                           column(4,sliderInput("revenue_capture_rate","Revenue capture of bandwidth growth",min=0,max=100,value=50,step=5,post="%"))),
-                           p(class="context-note","Preset buttons populate the technical controls. You can then override any technical assumption manually.")),
+                         p(class="context-note","Starts from the predicted annual revenue, which reflects a fully ramped site at today's compute density and today's wave pricing, and scales it each operating year by the final yearly capacity factor (the standard ramp factor × the annual compute density increase factor) and by the wave price factor (the 400G wave price falls 10% a year by default). Year 1 is the build year, at today's price."),
+                         div(class="growth-assumptions",
+                             fluidRow(
+                               column(2,numericInput("cap_ramp_y1","Ramp factor, year 1",unname(capacity_ramp_default[["year1"]]),min=0,max=1.5,step=0.01)),
+                               column(2,numericInput("cap_ramp_y2","Ramp factor, year 2",unname(capacity_ramp_default[["year2"]]),min=0,max=1.5,step=0.01)),
+                               column(2,numericInput("cap_ramp_mature","Ramp factor, year 3+",unname(capacity_ramp_default[["mature"]]),min=0,max=1.5,step=0.01)),
+                               column(2,numericInput("cap_density_pct","Annual compute density increase (%)",compute_density_increase_default*100,min=0,max=50,step=0.1)),
+                               column(2,numericInput("cap_wave_price_pct","Annual wave price change (%)",wave_price_change_default*100,min=-50,max=20,step=0.5)),
+                               column(2,numericInput("cap_horizon","Forecast horizon (years)",capacity_horizon_default,min=1,max=20,step=1))),
+                             fluidRow(
+                               column(4,numericInput("cap_wave_price_start","Starting 400G wave price ($/month)",wave_price_start_default,min=1,step=50)),
+                               column(8,p(class="context-note",style="padding-top:28px;","Growth section only. Sets the yearly wave price and 400G wave equivalents; it does not change the revenue figures (they scale from predicted revenue). The 4MC financials keep their own $5,000 and -2%/yr."))),
+                             div(class="toggle-bar",
+                                 actionButton("cap_reset","Reset to standard assumptions",class="btn-default btn-sm"),
+                                 span(class="context-note","Standard: 0.33 / 0.66 / 0.95 ramp, 8.7% annual compute density increase, -10% annual wave pricing from $5,400/month, 10 years."))),
                          div(class="growth-grid",
-                             metric_card("Current revenue benchmark","growth_current_revenue","Current browser-model predicted annual revenue.","range-card"),
-                             metric_card("Future revenue opportunity","growth_future_revenue","Opportunity at the end of the selected horizon.","hero-card"),
-                             metric_card("Incremental opportunity","growth_incremental_revenue","Future opportunity minus current benchmark.","comparable-card"),
-                             metric_card("Growth multiple","growth_multiple","Future opportunity divided by current benchmark.","comparable-card")),
+                             metric_card("Predicted annual revenue (baseline)","cap_baseline_revenue","Capacity factor 1.00: fully ramped at today's density.","range-card"),
+                             metric_card("Year 1 revenue (ramp-up)","cap_year1_revenue","Predicted revenue × year 1 capacity factor.","range-card"),
+                             metric_card("First mature year","cap_mature_revenue","First year at the full ramp factor.","comparable-card"),
+                             metric_card("Final-year revenue","cap_final_revenue","Price-adjusted revenue in the last year · net factor (capacity × wave price).","hero-card"),
+                             metric_card("Cumulative revenue","cap_cumulative_revenue","Price-adjusted sum over the forecast horizon.","finance-card"),
+                             metric_card("Wave pricing impact","cap_pricing_impact","Cumulative revenue lost to wave price erosion vs constant pricing.","range-card")),
                          div(class="plot-panel",plotOutput("future_growth_plot",height=360)),
-                         details_panel("Annual bandwidth-demand growth outlook",DTOutput("future_growth_table"),
-                                       p(class="context-note","Future revenue opportunity = current predicted revenue × [1 + capture rate × (bandwidth-demand index − 1)]. This is an assumption-driven opportunity view, not a committed forecast.")))
+                         div(class="subsection-title","Yearly capacity and wave price factors"),
+                         uiOutput("growth_baseline_note"),
+                         DTOutput("future_growth_table"),
+                         p(class="context-note","Read left to right. (1) Final yearly capacity factor = ramp factor × compute density increase factor. (2) 400G wave equivalents = the number of 400G waves the revenue opportunity represents = revenue opportunity ÷ (400G wave price × 12); it grows with capacity only. (3) Wave price factor = (1 + annual wave price change)^(operating year − 1); 400G wave price = starting price × wave price factor. (4) Revenue opportunity = predicted annual revenue × capacity factor × wave price factor (net revenue factor), which equals 400G waves × wave price × 12. (5) Revenue at constant pricing = the same waves at the starting price; wave pricing impact = revenue opportunity − revenue at constant pricing. The starting wave price changes the wave count and price columns, not the revenue. Assumption-driven opportunity view, not a committed forecast; it assumes revenue scales one-for-one with deployed capacity and wave price."))
                  )
+        ),
+        tabPanel("Performance ranking",
+                 div(class = "section-panel", section_heading("Where the proposed site lands", "SEGMENT PERFORMANCE"),
+                     p(class = "context-note", "Same High / Medium / Low classes as the Overview: every site is ranked by annual revenue within its own segment across the whole portfolio, and the proposed site is placed using its predicted revenue. Revenue per sqft and per MW percentiles are shown for context only; they do not change the class. Change the class limits on the Overview."),
+                     div(class = "metric-grid customer-metric-grid",
+                         html_metric_card("Performer class (predicted)", "perf_class", "hero-card"),
+                         metric_card("Revenue percentile (segment)", "perf_p_revenue", "Share of same-segment sites earning the same or less.", "range-card"),
+                         metric_card("Segment rank (predicted)", "perf_segment_rank", "Where the predicted revenue would rank in its segment.", "comparable-card"),
+                         metric_card("Revenue / sqft & / MW percentiles", "perf_p_productivity", "Per sqft | per MW vs same-segment sites (context).", "comparable-card")),
+                     uiOutput("perf_context")),
+                 div(class = "section-panel", section_heading("What each class looks like", "PROPOSED SITE'S SEGMENT"),
+                     radioButtons("class_profile_scope", NULL,
+                                  c("Entire segment portfolio" = "portfolio", "Matched sites only" = "matched"),
+                                  "portfolio", inline = TRUE),
+                     uiOutput("class_profile_note"),
+                     DTOutput("perf_bucket_summary")),
+                 div(class = "section-panel", section_heading("Matched data centers within their segment", "MATCHED VS PORTFOLIO"),
+                     radioButtons("perf_plot_scope", NULL,
+                                  c("Matched sites" = "matched", "Proposed vs entire segment portfolio" = "portfolio"),
+                                  "matched", inline = TRUE),
+                     div(class = "plot-panel", plotOutput("perf_plot", height = 520)),
+                     DTOutput("perf_matched_table")),
+                 details_panel("Full portfolio ranking (all segments)", DTOutput("perf_portfolio_table"))
+        ),
+        tabPanel("Model explanation",
+                 div(class = "section-panel", section_heading("What drove the prediction", "MODEL EXPLANATION"),
+                     p(class = "context-note", "The model starts from a typical site across its training set and adjusts it for each of the proposed site's inputs. Each step multiplies the running total; together they give the prediction exactly."),
+                     div(class = "metric-grid customer-metric-grid",
+                         metric_card("Typical site (model starting point)", "drv_baseline", "Training-set starting point, before any inputs.", "range-card"),
+                         html_metric_card("Biggest upward driver", "drv_top_up", "comparable-card"),
+                         html_metric_card("Biggest downward driver", "drv_top_down", "finance-card"),
+                         metric_card("Predicted annual revenue", "drv_prediction", "Typical site × every step below.", "hero-card")),
+                     div(class = "subsection-title", "How the prediction is built"),
+                     uiOutput("drv_note"),
+                     div(class = "plot-panel", plotOutput("drv_plot", height = 340)),
+                     DTOutput("drv_table"),
+                     uiOutput("sanity_check"),
+                     details_panel("Sanity check: sites the model sees as most similar", DTOutput("infl_table"),
+                                   p(class = "context-note", "Reference only, not used in any calculation. Model similarity = share of the model's decision trees that put the site in the same group as the proposed site.")))
         ),
         tabPanel("Matched GLMs",
                  div(class = "section-panel", section_heading("Matched historical facilities", "Closest on-net facilities ranked by physical similarity"),
                      uiOutput("comparable_scope_detail"), uiOutput("match_warnings_detail"),
                      p(class = "context-note", "Annual revenue: Aug 2025-Jul 2026; all products. Customer counts are unique per GLM, not across sites. Quotes are not sales."),
+                     uiOutput("performer_summary_matched"),
                      div(class = "compact-table-wrap", DTOutput("comparable_compact")),
+                     uiOutput("match_score_summary"),
+                     details_panel("What is the Match Score?",
+                                   p(tags$strong("Match Score = size distance + 0.25 × power distance + urban/rural penalty."),
+                                     " It measures how physically different an existing site is from the proposed site. ",
+                                     tags$strong("Lower is closer; 0 = same size, same power and same urban/rural type.")),
+                                   tags$ul(
+                                     tags$li(tags$strong("Size distance = |ln(site sqft ÷ proposed sqft)|. "), "Twice as big and half as big count the same (0.69). Missing size counts as 2."),
+                                     tags$li(tags$strong("Power distance = |ln(site power ÷ proposed power)|, weighted at a quarter. "), "Twice the power adds only 0.17. Missing power counts as 1 (0.25 after weighting)."),
+                                     tags$li(tags$strong("Urban/rural penalty: "), "0 if the same type, 0.25 if different, 0.125 if either is UNKNOWN.")),
+                                   div(class = "subsection-title", "Colour bands"),
+                                   DTOutput("match_score_bands"),
+                                   div(class = "subsection-title", "Quick reference: size difference alone"),
+                                   DTOutput("match_score_reference"),
+                                   p(class = "context-note", "The score has no fixed maximum, but in practice most matches fall between 0 and 2. A site missing both size and power scores at least 2.25. The score only orders the sites in the market scope (city, then state, then national) and keeps up to 25; it does not drop poor matches, so a small market can include red-scored sites. CAPEX, revenue and on-net date play no part in the score.")),
                      uiOutput("matched_average_summary"),
+                     uiOutput("order_period_ui"),
+                     uiOutput("matched_order_summary"),
                      p(class = "context-note", "% billed uses the normalized base, not facility tenants. Click a row to see its complete workbook record.")),
                  div(class = "section-panel", section_heading("Selected GLM: full workbook record"),
                      selectInput("detail_glm", "GLM", choices = character()),
@@ -1178,7 +1784,7 @@ ui <- fluidPage(
                                DTOutput("historical_financials_table"))
         ),
         tabPanel("Model details",
-                 div(class = "section-panel", section_heading("Model status & historical signal", "Browser revenue model"),
+                 div(class = "section-panel", section_heading("Model status & historical signal", "Secondary model"),
                      uiOutput("model_status"), uiOutput("secondary_status"),
                      p(class = "context-note", "Historical all-product prediction, not future revenue or customer growth."),
                      div(class = "reference-grid",
@@ -1195,7 +1801,7 @@ ui <- fluidPage(
                                p("City/state/segment, then state/segment, then national segment; up to 25 closest physical matches. Small pools are not padded. Size, capacity and urban/rural determine closeness."),
                                DTOutput("scope_table"),
                                p("Business summaries use arithmetic averages of valid site values. % billed averages per-GLM ratios, not pooled counts. Unique counts cannot be deduplicated across GLMs."),
-                               p("The browser-compatible ridge model uses log annual revenue, standardized encoded predictors, lambda = 1, and deterministic five-fold cross-validation. Numeric missing-value imputation and the fitted-error heuristic use medians; heuristic bounds are not calibrated intervals.")),
+                               p("Secondary training retains its existing settings. Numeric missing-value imputation and the fitted-error heuristic still use medians; heuristic bounds are not calibrated intervals.")),
                  details_panel("Average samples & size-adjusted references",
                                DTOutput("average_samples_table"),
                                div(class = "reference-grid", metric_card("Average size-adjusted annual revenue", "size_anchor"),
@@ -1219,28 +1825,96 @@ ui <- fluidPage(
 server <- function(input, output, session) {
   model_bundle <- reactiveVal(NULL)
   scoring_result <- reactiveVal(NULL)
+  order_data <- reactiveVal(NULL)
+  order_note <- reactiveVal("Optional: upload the order extract for a new-order comparison on matched GLMs. Not used by the model.")
+  observeEvent(input$load_orders, {
+    path <- if (!is.null(input$order_file)) input$order_file$datapath else default_order_file_path
+    name <- if (!is.null(input$order_file)) input$order_file$name else default_order_file_path
+    if (is.null(input$order_file) && !file.exists(path)) {
+      order_note(paste0("Choose an order file first (", default_order_file_path, " is not in the app folder).")); return()
+    }
+    order_note("Loading order data…")
+    tryCatch({
+      od <- withProgress(message = "Loading order data", value = 0.5, load_order_months(path, input$order_sheet_name, name))
+      order_data(od)
+      order_note(paste0("Order data ready: ", comma(od$rows), " rows, ", comma(length(od$glms_any_period)), " GLMs, ",
+                        format(od$first_month, "%b %Y"), " - ", format(od$last_month, "%b %Y"), "."))
+      showNotification("Order data loaded.", type = "message")
+    }, error = function(e) {
+      order_data(NULL)
+      order_note(paste("Order data not loaded:", conditionMessage(e)))
+      showNotification(order_note(), type = "error", duration = NULL)
+    })
+  }, ignoreInit = TRUE)
+  output$order_status <- renderUI(p(class = "sidebar-note", order_note()))
+  output$order_period_ui <- renderUI({
+    od <- order_data(); req(od)
+    div(class = "toggle-bar",
+        dateRangeInput("order_range", "Order period (compared as an annual rate)", start = od$first_month, end = od$last_month,
+                       min = od$first_month, max = od$last_month, format = "M yyyy", startview = "year"),
+        actionButton("order_range_all", "All months", class = "btn-default btn-sm"),
+        actionButton("order_range_billed", "Billed-revenue months", class = "btn-default btn-sm"))
+  })
+  observeEvent(input$order_range_all, {
+    od <- order_data(); req(od)
+    updateDateRangeInput(session, "order_range", start = od$first_month, end = od$last_month)
+  })
+  observeEvent(input$order_range_billed, {
+    updateDateRangeInput(session, "order_range", start = as.Date("2025-08-01"), end = as.Date("2026-07-01"))
+  })
+  order_period <- reactive({
+    od <- order_data(); req(od)
+    rng <- input$order_range
+    if (length(rng) == 2 && all(!is.na(rng))) order_period_summary(od, rng[[1]], rng[[2]]) else order_period_summary(od)
+  })
+  portfolio_orders <- reactive({
+    b <- model_bundle(); req(b)
+    attach_order_activity(b$historical_profile %>% select(GLM_ID, Total_MRR_12M), order_period())
+  })
+  matched_orders <- reactive({
+    if (is.null(order_data())) return(attach_order_activity(matched_classified(), NULL))
+    attach_order_activity(matched_classified(), order_period())
+  })
   model_message <- reactiveVal("Choose a workbook and click Load workbook.")
   load_message <- reactiveVal("Choose a workbook and click Load workbook.")
+  current_training <- reactive({
+    yr <- suppressWarnings(as.integer(input_number(input$train_cutoff)))
+    list(mode = if (identical(input$train_set, "after")) "after" else "all", year = if (is.finite(yr)) yr else 2019L)
+  })
+  output$train_set_note <- renderUI({
+    b <- model_bundle(); t <- current_training()
+    loaded <- if (!is.null(b) && !is.null(b$training)) b$training else NULL
+    changed <- !is.null(loaded) && (loaded$mode != t$mode || (t$mode == "after" && loaded$year != t$year))
+    msg <- if (changed) paste0("Click Load workbook to retrain on: ", training_label(t), ". Current model: ", b$training_label, ".") else
+      if (t$mode == "after") "Retrains when you click Load workbook. Fewer GLMs = a less stable model; cities/states with no newer GLMs fall back to the typical site." else NULL
+    if (is.null(msg)) NULL else p(class = if (changed) "sidebar-note warning" else "sidebar-note", msg)
+  })
   observeEvent(input$load_model, {
-    if (is.null(input$model_file)) {
-      showNotification("Choose an Excel workbook before loading.", type = "error")
-      return(invisible(NULL))
-    }
-    path <- input$model_file$datapath
-    workbook_name <- input$model_file$name
+    path <- if (!is.null(input$model_file)) input$model_file$datapath else default_file_path
     model_bundle(NULL); scoring_result(NULL)
     updateSelectInput(session, "detail_glm", choices = character(), selected = character())
     load_message("Loading workbook…")
-    model_message("Loading characteristics and browser-compatible calculations…")
+    model_message("Loading characteristics and secondary calculations…")
     tryCatch({
       bundle <- withProgress(message = "Loading on-net evidence", value = 0, {
-        build_model_bundle(path, workbook_name, input$sheet_name,
-                           function(value, detail) setProgress(value = value, detail = detail))
+        build_model_bundle(path, input$sheet_name, function(value, detail) setProgress(value = value, detail = detail),
+                           training = current_training())
       })
-      bundle$workbook_label <- workbook_name
+      bundle$workbook_label <- if (!is.null(input$model_file)) input$model_file$name else default_file_path
       bundle$sheet_name <- input$sheet_name
       model_bundle(bundle)
-      load_message(paste("Workbook ready:", comma(nrow(bundle$historical_profile)), "eligible GLMs. Match the site next."))
+      # Urban / rural choices come from the workbook so the proposed site always uses a value the
+      # model and matching have seen (most common first; UNKNOWN last).
+      ur_counts <- sort(table(bundle$historical_profile$urban_rural), decreasing = TRUE)
+      ur_values <- c(setdiff(names(ur_counts), "UNKNOWN"), intersect("UNKNOWN", names(ur_counts)))
+      if (length(ur_values)) {
+        current_ur <- toupper(trimws(isolate(input$urban_rural)))
+        updateSelectInput(session, "urban_rural",
+                          choices = setNames(ur_values, paste0(ur_values, " (", as.integer(ur_counts[ur_values]), " sites)")),
+                          selected = if (length(current_ur) && current_ur %in% ur_values) current_ur else ur_values[[1]])
+      }
+      load_message(paste("Workbook ready:", comma(nrow(bundle$historical_profile)), "eligible GLMs.",
+                         bundle$onnet_note, "Match the site next."))
       model_message(paste("On-net profile ready.", bundle$model_message))
       showNotification("Workbook loaded. Match the proposed site next.", type = "message")
     }, error = function(e) {
@@ -1249,13 +1923,28 @@ server <- function(input, output, session) {
       showNotification(model_message(), type = "error", duration = NULL)
     })
   }, ignoreInit = TRUE)
+  current_vintage <- reactive({
+    mode <- if (is.null(input$onnet_vintage)) "all" else input$onnet_vintage
+    yr <- suppressWarnings(as.integer(input_number(input$onnet_cutoff)))
+    list(mode = mode, year = if (is.finite(yr)) yr else 2019L)
+  })
+  output$vintage_pool_note <- renderUI({
+    b <- model_bundle(); req(b); v <- current_vintage()
+    hp <- b$historical_profile; seg <- normalize_segment(input$dc_segment)
+    all_seg <- sum(hp$DC_Segments == seg); kept <- filter_vintage(hp, v); kept_seg <- sum(kept$DC_Segments == seg)
+    n_new <- sum(!is.na(hp$Bill_Year) & hp$Bill_Year >= v$year)
+    txt <- if (v$mode == "all") paste0("All ", comma(nrow(hp)), " eligible GLMs (", comma(n_new), " first billed ", v$year, "+).") else
+      paste0(vintage_label(v), ": ", comma(nrow(kept)), " of ", comma(nrow(hp)), " eligible GLMs; ",
+                       comma(kept_seg), " of ", comma(all_seg), " in Segment ", seg, ".")
+    p(class = "sidebar-note", txt)
+  })
   observeEvent(input$score_dc, {
     req(model_bundle())
     site <- tibble(GLM_ID = input$glm_id, Year_Build = input_number(input$year_build), SQ_foot = input_number(input$sq_foot),
                    Capacity = input_number(input$capacity), CAPEX = input_number(input$capex), state = input$state, city = input$city,
                    urban_rural = input$urban_rural, DC_Segments = input$dc_segment)
     tryCatch({
-      result <- score_new_dc(model_bundle(), site)
+      result <- score_new_dc(model_bundle(), site, current_vintage())
       scoring_result(result)
       ids <- result$comparable_facilities$GLM_ID
       updateSelectInput(session, "detail_glm", choices = ids, selected = if (length(ids)) ids[[1]] else character())
@@ -1278,17 +1967,18 @@ server <- function(input, output, session) {
     b <- model_bundle()
     div(class = "note", tags$strong(model_message()), if (!is.null(b)) tagList(tags$br(),
                                                                                paste("Confirmed on-net:", comma(b$onnet_rows), "| eligible comparable GLMs:", comma(nrow(b$historical_profile))),
-                                                                               tags$br(), paste("Browser-model training rows:", comma(b$eligible_rows))))
+                                                                               tags$br(), paste0("Model trained on: ", b$training_label, " | training rows: ", comma(b$eligible_rows))))
   })
   output$loaded_workbook_context <- renderUI({
     b <- model_bundle(); req(b)
     p(class = "context-note", paste("Loaded:", b$workbook_label, "| sheet:", b$sheet_name,
-                                    "| eligible GLMs:", comma(nrow(b$historical_profile))))
+                                    "| eligible GLMs:", comma(nrow(b$historical_profile)), "| model trained on:", b$training_label,
+                                    paste0("(", comma(b$eligible_rows), " GLMs)")))
   })
   
   scope_ui <- function() {
     r <- scoring_result(); req(r)
-    span(class = "scope-badge", paste(r$comparable_scope, "|", r$comparable_total, "matched /", r$comparable_candidate_count, "candidates"))
+    span(class = "scope-badge", paste(r$comparable_scope, "|", r$comparable_total, "matched /", r$comparable_candidate_count, "candidates |", r$vintage_label))
   }
   output$comparable_scope <- renderUI(scope_ui())
   output$comparable_scope_detail <- renderUI(scope_ui())
@@ -1297,6 +1987,7 @@ server <- function(input, output, session) {
     div(class="matching-summary",div(class="matching-summary-title","Why these data centers were selected for comparison"),tags$ul(
       tags$li(tags$strong("Required segment: "),paste0("Segment ",r$input$DC_Segments[[1]])),
       tags$li(tags$strong("Geographic scope: "),r$comparable_scope),
+      tags$li(tags$strong("Bill-year filter: "),paste0(r$vintage_label," (",comma(r$vintage_pool)," of ",comma(r$vintage_portfolio)," eligible GLMs)")),
       tags$li(tags$strong("Similarity: "),"square footage, capacity and urban/rural classification"),
       tags$li(tags$strong("Selection: "),paste0(r$comparable_total," of ",r$comparable_candidate_count," candidates"))))
   })
@@ -1304,8 +1995,12 @@ server <- function(input, output, session) {
     r <- scoring_result(); req(r)
     sites <- r$comparable_facilities
     notes <- character()
-    if (!nrow(sites)) notes <- c(notes, "No eligible on-net GLMs in this segment.")
+    if (!nrow(sites)) notes <- c(notes, if (!is.null(r$vintage) && r$vintage$mode != "all")
+      paste0("No eligible on-net GLMs in this segment for '", r$vintage_label, "'. Widen the bill-year filter and re-match.") else
+      "No eligible on-net GLMs in this segment.")
     if (nrow(sites) > 0 && nrow(sites) < 5) notes <- c(notes, "Fewer than 5 matches; averages are descriptive only.")
+    if (!is.null(r$vintage) && r$vintage$mode == "after")
+      notes <- c(notes, paste0("Newer bill-year filter: GLMs first billed in the last few years are often still ramping, so their revenue (and the averages) can understate a mature site."))
     conflicts <- sum(sites$Normalized_Base_Conflict)
     if (conflicts) notes <- c(notes, paste(conflicts, "GLMs exceed 100% billed: billed/base counts differ; values are not capped."))
     invalid <- sum(!is.finite(sites$Billed_Percent_Normalized))
@@ -1319,108 +2014,447 @@ server <- function(input, output, session) {
     datatable(r$comparable_scope_counts, rownames = FALSE, options = list(dom = "t", ordering = FALSE))
   })
   averages <- reactive({ r <- scoring_result(); req(r); matched_measures(r$comparable_facilities) })
-  output$average_tenants <- renderText(fmt_count(averages()$Average[[1]]))
-  ###output$average_normalized_base <- renderText(fmt_count(averages()$Average[[2]]))
-  output$average_customers <- renderText(fmt_count(averages()$Average[[3]]))
-  #####output$average_billed_percent <- renderText(fmt_percent(averages()$Average[[4]]))
-  output$average_revenue <- renderText(fmt_dollar(averages()$Average[[5]]))
-  output$historical_revenue_range <- renderText({
-    
-    r <- scoring_result()
-    req(r)
-    
-    revenue_values <- r$comparable_facilities$Total_MRR_12M
-    
-    revenue_values <- revenue_values[
-      is.finite(revenue_values) &
-        revenue_values >= 0
-    ]
-    
-    if (!length(revenue_values)) {
-      return("Unavailable")
-    }
-    
-    paste(
-      fmt_dollar(min(revenue_values)),
-      "-",
-      fmt_dollar(max(revenue_values))
-    )
+  # Unified performer classes: one table for the whole portfolio, by segment.
+  tier_pct <- reactive({
+    x <- input_number(input$tier_pct)
+    if (!is.finite(x) || x < 1 || x > 33) tier_pct_default else x
   })
-  output$overview_estimated_tenants <- renderText({r<-scoring_result();req(r);fmt_count(r$anchors$tenants)})
-  output$overview_estimated_customers <- renderText({r<-scoring_result();req(r);fmt_count(r$anchors$customers)})
+  tiers <- reactive({ b <- model_bundle(); req(b); revenue_tier_table(b$historical_profile, tier_pct()) })
+  matched_class_result <- reactive({
+    r <- scoring_result(); req(r); t <- tiers(); seg <- r$input$DC_Segments[[1]]
+    sites <- r$comparable_facilities %>%
+      left_join(t %>% select(GLM_ID, Tier, Revenue_Percentile, Segment_Rank, Segment_Sites), by = "GLM_ID") %>%
+      mutate(Performer_Class = factor(ifelse(is.na(Tier), "Unclassified", as.character(Tier)), levels = class_levels))
+    pool <- t %>% filter(DC_Segments == seg)
+    list(sites = sites, n = nrow(sites), pct = tier_pct(), segment = seg,
+         segment_n = sum(is.finite(pool$Revenue)),
+         lower = if (nrow(pool)) pool$Lower[[1]] else NA_real_,
+         upper = if (nrow(pool)) pool$Upper[[1]] else NA_real_)
+  })
+  matched_classified <- reactive(matched_class_result()$sites)
+  medium_revenue <- reactive({
+    m <- matched_classified()
+    x <- m$Total_MRR_12M[m$Performer_Class == "Medium"]
+    x[is.finite(x) & x >= 0]
+  })
+  all_matched_revenue <- reactive({
+    x <- matched_classified()$Total_MRR_12M
+    x[is.finite(x) & x >= 0]
+  })
+  revenue_range_text <- function(x) if (!length(x)) "Unavailable" else paste(fmt_dollar(min(x)), "-", fmt_dollar(max(x)))
+  performer_counts_text <- function(m) {
+    counts <- table(m$Performer_Class)
+    paste0(counts[["High"]], " High | ", counts[["Medium"]], " Medium | ", counts[["Low"]], " Low",
+           if (counts[["Unclassified"]]) paste0(" | ", counts[["Unclassified"]], " without revenue") else "")
+  }
+  pct_label <- function(x) paste0(formatC(x, format = "fg", digits = 3), "%")
+  fences_text <- function(cr) {
+    if (!is.finite(cr$upper)) return(paste0("Segment ", cr$segment, " has too few sites with revenue to set class limits; all are treated as Medium."))
+    paste0("High = top ", pct_label(cr$pct), " of Segment ", cr$segment, " by annual revenue (above ", fmt_dollar(cr$upper),
+           "); Low = bottom ", pct_label(cr$pct), " (below ", fmt_dollar(cr$lower), "); based on all ",
+           comma(cr$segment_n), " Segment ", cr$segment, " sites in the portfolio.")
+  }
+  fmt_multiple <- function(x) {
+    ifelse(!is.finite(x), "Unavailable",
+           ifelse(x >= 100, paste0(formatC(x, format = "f", digits = 0), "×"),
+                  ifelse(x >= 10, paste0(formatC(x, format = "f", digits = 1), "×"),
+                         ifelse(x >= 0.01, paste0(formatC(x, format = "f", digits = 2), "×"), "<0.01×"))))
+  }
+  proposed_class_info <- reactive({ r <- scoring_result(); req(r); proposed_tier(r, tiers()) })
+  predicted_class <- reactive(proposed_class_info()$tier)
+  output$position_predicted_class <- renderText({ x <- predicted_class(); if (is.null(x) || is.na(x)) "Unavailable" else x })
+  class_lookup <- reactive(tiers() %>% transmute(GLM_ID, Performer = as.character(Tier)))
+  output$rule_bar_note <- renderUI({
+    cr <- matched_class_result()
+    p(class = "context-note", style = "margin:0 0 8px;", fences_text(cr))
+  })
+  output$performer_benchmark_note <- renderUI({
+    r <- scoring_result(); req(r); m <- matched_classified(); med <- medium_sites()
+    counts <- table(m$Performer_Class)
+    excluded <- counts[["High"]] + counts[["Low"]]
+    rev_all <- all_matched_revenue(); rev_med <- medium_revenue()
+    div(class = "mini-compare",
+        span(class = "mc-title", paste0("Medium only (", nrow(med), ") vs all matched (", nrow(m), "):")),
+        span(tags$strong("Tenants "), fmt_count(nn_mean(med$derived_tenant_count)), " vs ", fmt_count(nn_mean(m$derived_tenant_count))),
+        span(tags$strong("Billed customers "), fmt_count(nn_mean(med$Unique_Billing_Customer_Count_12M)), " vs ",
+             fmt_count(nn_mean(m$Unique_Billing_Customer_Count_12M))),
+        span(tags$strong("Revenue "), if (length(rev_med)) fmt_dollar(mean(rev_med)) else "—", " vs ",
+             if (length(rev_all)) fmt_dollar(mean(rev_all)) else "—"),
+        span(tags$strong("Range "), revenue_range_text(rev_med), " vs ", revenue_range_text(rev_all)),
+        span(paste0(excluded, " High / Low site", if (excluded == 1) "" else "s", " in the match")))
+  })
+  output$projected_compare <- renderUI({
+    r <- scoring_result(); req(r); req(nrow(medium_sites()) > 0)
+    a_med <- size_adjusted_anchors(medium_sites(), r$input$SQ_foot[[1]]); a_all <- r$anchors
+    div(class = "mini-compare",
+        span(class = "mc-title", "Medium matched sites vs all matched sites:"),
+        span(tags$strong("Tenants "), fmt_count(a_med$tenants), " vs ", fmt_count(a_all$tenants)),
+        span(tags$strong("Billed customers "), fmt_count(a_med$customers), " vs ", fmt_count(a_all$customers)),
+        span("Predicted revenue and range come from the model and do not change with the toggle."))
+  })
+  output$performer_overview <- renderUI({
+    r <- scoring_result(); req(r); m <- matched_classified(); cr <- matched_class_result()
+    med <- medium_revenue(); all <- all_matched_revenue()
+    counts <- table(m$Performer_Class)
+    total <- nrow(m)
+    ratio <- if (is.finite(r$predicted_revenue) && length(med)) r$predicted_revenue / mean(med) else NA_real_
+    has_fences <- is.finite(cr$upper)
+    tile <- function(cls, label, rule, role) {
+      div(class = paste("class-tile", cls),
+          div(class = "class-tile-head", div(class = "class-label", label),
+              div(class = "class-count", counts[[label]], tags$small(paste("of", total)))),
+          div(class = "class-rule", rule), div(class = "class-role", role))
+    }
+    bench <- function(cls, title, value, sub) {
+      div(class = paste("benchmark-card", cls), div(class = "metric-title", title),
+          div(class = "benchmark-value", value), div(class = "benchmark-sub", sub))
+    }
+    tagList(
+      div(class = "class-grid",
+          tile("high", "High", if (has_fences) paste0("Top ", pct_label(cr$pct), " of Segment ", cr$segment, ": above ", fmt_dollar(cr$upper)) else "No limit (too few sites)",
+               "Excluded from the benchmark"),
+          tile("medium", "Medium", if (has_fences) paste0("Middle ", pct_label(100 - 2 * cr$pct), ": ", fmt_dollar(cr$lower), " to ", fmt_dollar(cr$upper)) else "All matched sites with revenue",
+               "Like-for-like baseline for the proposed site"),
+          tile("low", "Low", if (has_fences) paste0("Bottom ", pct_label(cr$pct), " of Segment ", cr$segment, ": below ", fmt_dollar(cr$lower)) else "No limit (too few sites)",
+               "Excluded from the benchmark")),
+      div(class = "benchmark-grid",
+          bench("primary", "Medium-performer benchmark", if (length(med)) fmt_dollar(mean(med)) else "Unavailable",
+                paste0("Average of ", length(med), " Medium sites | range ", revenue_range_text(med))),
+          bench("", "All matched sites", if (length(all)) fmt_dollar(mean(all)) else "Unavailable",
+                paste0("Average of ", length(all), " sites incl. outliers | range ", revenue_range_text(all))),
+          bench("proposed", "Proposed site vs benchmark", fmt_multiple(ratio),
+                paste0("Predicted ", fmt_dollar(r$predicted_revenue), " vs Medium average ",
+                       if (length(med)) fmt_dollar(mean(med)) else "Unavailable"))),
+      if (length(med) && length(med) < 5)
+        div(class = "warning", "Fewer than 5 Medium performers among the matches; the benchmark is indicative only."))
+  })
+  output$performer_class_table <- renderDT({
+    r <- scoring_result(); req(r)
+    m <- matched_classified() %>%
+      mutate(.order = match(as.character(Performer_Class), c("High", "Medium", "Low", "Unclassified"))) %>%
+      arrange(.order, desc(Total_MRR_12M))
+    validate(need(nrow(m) > 0, "No matched data centers."))
+    m %>%
+      transmute(Class = paste0('<span class="class-badge ', tolower(Performer_Class), '">', Performer_Class, '</span>'),
+                GLM_ID, Operator = DC_Operator, Location = paste(city, state, sep = ", "), Segment = DC_Segments,
+                `Annual revenue` = Total_MRR_12M, `Revenue percentile (segment)` = Revenue_Percentile,
+                `Segment rank` = paste(Segment_Rank, "of", Segment_Sites),
+                `Size (sqft)` = SQ_foot, `Power (MW)` = Capacity, `Urban / Rural` = urban_rural,
+                `On-net date` = ifelse(is.na(Onnet_Date), "Missing", format(Onnet_Date, "%Y-%m-%d")),
+                `Years on-net` = Years_Onnet, `Bill year` = bill_year_text(Bill_Year), `Match rank` = Comparable_Rank) %>%
+      datatable(rownames = FALSE, escape = FALSE, selection = "none",
+                options = list(dom = "t", ordering = FALSE, scrollX = TRUE, pageLength = 50)) %>%
+      formatCurrency("Annual revenue", "$", digits = 0) %>% formatPercentage("Revenue percentile (segment)", 0) %>%
+      formatRound("Size (sqft)", 0) %>% formatRound("Power (MW)", 1) %>% formatRound("Years on-net", 1)
+  })
+  output$performer_method_note <- renderUI({
+    r <- scoring_result(); req(r); cr <- matched_class_result(); inp <- r$input
+    tagList(
+      tags$ol(class = "context-note",
+        tags$li(tags$strong("Comparison group: "), paste0(
+          "the ", r$comparable_total, " matched data centers for the proposed site — all Segment ", inp$DC_Segments[[1]],
+          ", market scope '", r$comparable_scope, "' (city first, then state, then national), and the closest ",
+          "on size, power and urban/rural out of ", r$comparable_candidate_count, " candidates. Every matched site is judged against this same group.")),
+        tags$li(tags$strong("Classification (one system across the app): "), paste0(
+          "every eligible site in the portfolio is ranked by annual revenue within its own segment. ", fences_text(cr),
+          " Matched sites carry their portfolio class, and the proposed site's predicted revenue is placed against the same limits.")),
+        tags$li(tags$strong("Benchmark: "), "the average and range of the matched Medium sites (top and bottom trimmed equally); the proposed site's predicted revenue is compared with it. The Performance ranking tab uses the same classes."),
+        tags$li(tags$strong("On-net date: "), "shown for each site for context; it is not used to classify.")),
+      DTOutput("performer_scope_table"))
+  })
+  output$performer_scope_table <- renderDT({
+    r <- scoring_result(); req(r)
+    datatable(r$comparable_scope_counts %>% rename(`Market scope` = Scope, `Eligible sites in scope` = Sites),
+              rownames = FALSE, options = list(dom = "t", ordering = FALSE))
+  })
+  output$performer_summary_matched <- renderUI({
+    r <- scoring_result(); req(r); m <- matched_classified(); cr <- matched_class_result()
+    div(class = "note", tags$strong(paste0("Performer classification: ", performer_counts_text(m), ". ")),
+        fences_text(cr), " Medium sites are the benchmark for the proposed site.")
+  })
+  medium_sites <- reactive({ m <- matched_classified(); m[m$Performer_Class == "Medium", , drop = FALSE] })
+  # Matched sites in use for the profile averages and the projected estimates (toggle on the Overview).
+  excluding_outliers <- reactive(!isFALSE(input$exclude_outliers))
+  comparison_sites <- reactive({
+    med <- medium_sites()
+    if (excluding_outliers() && nrow(med)) med else matched_classified()
+  })
+  comparison_revenue <- reactive({ x <- comparison_sites()$Total_MRR_12M; x[is.finite(x) & x >= 0] })
+  anchors_used <- reactive({
+    r <- scoring_result(); req(r)
+    if (!excluding_outliers() || !nrow(medium_sites())) return(r$anchors)
+    size_adjusted_anchors(medium_sites(), r$input$SQ_foot[[1]])
+  })
+  output$comparison_status <- renderUI({
+    r <- scoring_result(); req(r); m <- matched_classified(); cs <- comparison_sites()
+    span(class = "status-pill",
+         if (excluding_outliers() && nrow(medium_sites())) paste0("Using ", nrow(cs), " Medium of ", nrow(m), " matched sites")
+         else paste0("Using all ", nrow(m), " matched sites (High / Low included)"))
+  })
+  comp_per_customer <- reactive({
+    cs <- comparison_sites()
+    ok <- is.finite(cs$Total_MRR_12M) & cs$Total_MRR_12M >= 0 &
+      is.finite(cs$Unique_Billing_Customer_Count_12M) & cs$Unique_Billing_Customer_Count_12M > 0
+    if (!any(ok)) NA_real_ else sum(cs$Total_MRR_12M[ok]) / sum(cs$Unique_Billing_Customer_Count_12M[ok])
+  })
+  comp_revenue_value <- reactive({ x <- comp_per_customer(); cu <- anchors_used()$customers; if (is.finite(x) && is.finite(cu)) x * cu else NA_real_ })
+  output$comp_rev_per_customer <- renderText(fmt_dollar(comp_per_customer()))
+  output$input_compare_table <- renderDT({
+    r <- scoring_result(); req(r); inp <- r$input; cs <- comparison_sites(); m <- matched_classified()
+    d <- drivers()
+    effect <- function(feature) {
+      if (!isTRUE(d$available)) return(NA_real_)
+      x <- d$table$Multiplier[d$table$Feature == feature]
+      if (length(x)) x[[1]] else NA_real_
+    }
+    avg <- function(x) safe_mean(nonnegative_values(x))
+    share <- function(v, target) if (!length(v)) "—" else paste0(sum(v == target, na.rm = TRUE), " of ", length(v), " same")
+    num_row <- function(label, prop, v_use, v_all, feature, fmt) {
+      a_use <- avg(v_use)
+      tibble(Input = label, `Proposed site` = fmt(prop), `Matched sites in use (avg)` = fmt(a_use),
+             `All matched sites (avg)` = fmt(avg(v_all)),
+             `Proposed vs in use` = if (is.finite(prop) && is.finite(a_use) && a_use > 0) paste0(ifelse(prop >= a_use, "+", ""), percent(prop / a_use - 1, accuracy = 1)) else "—",
+             `Effect on prediction` = effect(feature))
+    }
+    cat_row <- function(label, prop, v_use, v_all, feature) {
+      tibble(Input = label, `Proposed site` = as.character(prop), `Matched sites in use (avg)` = share(v_use, prop),
+             `All matched sites (avg)` = share(v_all, prop), `Proposed vs in use` = "—", `Effect on prediction` = effect(feature))
+    }
+    num_fmt <- function(x) ifelse(is.finite(x), comma(x, accuracy = 1), "—")
+    mw_fmt <- function(x) ifelse(is.finite(x), comma(x, accuracy = 0.1), "—")
+    yr_fmt <- function(x) ifelse(is.finite(x), as.character(round(x)), "—")
+    rows <- bind_rows(
+      num_row("Size (sqft)", inp$SQ_foot[[1]], cs$SQ_foot, m$SQ_foot, "SQ_foot", num_fmt),
+      num_row("Power (MW)", inp$Capacity[[1]], cs$Capacity, m$Capacity, "Capacity", mw_fmt),
+      cat_row("State", inp$state[[1]], cs$state, m$state, "state"),
+      cat_row("City", inp$city[[1]], cs$city, m$city, "city"),
+      cat_row("Urban / rural", inp$urban_rural[[1]], cs$urban_rural, m$urban_rural, "urban_rural"),
+      cat_row("Segment", inp$DC_Segments[[1]], cs$DC_Segments, m$DC_Segments, "DC_Segments"),
+      num_row("Build year", inp$Year_Build[[1]], cs$Year_Build, m$Year_Build, "none", yr_fmt) %>% mutate(`Proposed vs in use` = "—"),
+      tibble(Input = "Years on-net", `Proposed site` = "Not yet on-net",
+             `Matched sites in use (avg)` = fmt_count(avg(cs$Years_Onnet)), `All matched sites (avg)` = fmt_count(avg(m$Years_Onnet)),
+             `Proposed vs in use` = "—", `Effect on prediction` = NA_real_))
+    datatable(rows, rownames = FALSE, selection = "none", options = list(dom = "t", ordering = FALSE, scrollX = TRUE)) %>%
+      formatRound("Effect on prediction", 2) %>%
+      formatStyle("Effect on prediction", color = styleInterval(c(0.995, 1.005), c("#b42318", "#475467", "#067647")), fontWeight = "700")
+  })
+  output$comp_revenue <- renderText(fmt_dollar(comp_revenue_value()))
+  output$model_rev_per_customer <- renderText({
+    r <- scoring_result(); req(r); cu <- anchors_used()$customers
+    if (is.finite(r$predicted_revenue) && is.finite(cu) && cu > 0) fmt_dollar(r$predicted_revenue / cu) else "Unavailable"
+  })
+  output$comp_revenue_note <- renderUI({
+    r <- scoring_result(); req(r); per <- comp_per_customer(); cu <- anchors_used()$customers
+    if (!is.finite(per) || !is.finite(cu) || cu <= 0 || !is.finite(r$predicted_revenue)) return(NULL)
+    implied <- r$predicted_revenue / cu
+    p(class = "context-note", paste0(
+      "The matched sites earn ", fmt_dollar(per), " per billed customer; the model's prediction works out to ", fmt_dollar(implied),
+      " per estimated customer. If the proposed site earned what the matched sites earn per customer, revenue would be about ",
+      fmt_dollar(per * cu), " instead of the predicted ", fmt_dollar(r$predicted_revenue),
+      ". Customers come from the matched sites; predicted revenue comes from the model, which learns from the whole portfolio."))
+  })
+
+  nn_mean <- function(x) safe_mean(nonnegative_values(x))
+  output$average_tenants <- renderText(fmt_count(nn_mean(comparison_sites()$derived_tenant_count)))
+  ###output$average_normalized_base <- renderText(fmt_count(averages()$Average[[2]]))
+  output$average_customers <- renderText(fmt_count(nn_mean(comparison_sites()$Unique_Billing_Customer_Count_12M)))
+  #####output$average_billed_percent <- renderText(fmt_percent(averages()$Average[[4]]))
+  output$average_revenue <- renderText({ x <- comparison_revenue(); if (length(x)) fmt_dollar(mean(x)) else "Unavailable" })
+  output$historical_revenue_range <- renderText(revenue_range_text(comparison_revenue()))
+  output$overview_estimated_tenants <- renderText(fmt_count(anchors_used()$tenants))
+  output$overview_estimated_customers <- renderText(fmt_count(anchors_used()$customers))
   
   output$overview_predicted_revenue <- renderText({r<-scoring_result();req(r);fmt_dollar(r$predicted_revenue)})
   
   output$overview_revenue_range <- renderText({r<-scoring_result();req(r);if(is.finite(r$heuristic_low)&&is.finite(r$heuristic_high)) paste(fmt_dollar(r$heuristic_low),"-",fmt_dollar(r$heuristic_high)) else "Unavailable"})
   output$position_revenue_rank_matched <- renderText({r<-scoring_result();req(r);x<-r$comparable_facilities$Total_MRR_12M;x<-x[is.finite(x)];if(!is.finite(r$predicted_revenue)||!length(x)) "Unavailable" else paste0(safe_rank(x,r$predicted_revenue)," of ",length(x))})
   output$position_revenue_rank_portfolio <- renderText({r<-scoring_result();b<-model_bundle();req(r,b);x<-b$historical_profile$Total_MRR_12M;x<-x[is.finite(x)];if(!is.finite(r$predicted_revenue)||!length(x)) "Unavailable" else paste0(safe_rank(x,r$predicted_revenue)," of ",length(x))})
-  output$positioning_context <- renderUI({r<-scoring_result();b<-model_bundle();req(r,b);div(class="note",paste("Predicted annual revenue",fmt_dollar(r$predicted_revenue),"is compared with",sum(is.finite(r$comparable_facilities$Total_MRR_12M)),"matched GLMs and",sum(is.finite(b$historical_profile$Total_MRR_12M)),"eligible historical GLMs."))})
-  
-  observeEvent(input$growth_scenario, {
-    presets <- list(
-      no_growth=list(growth=0,capture=100),
-      demand_no_revenue=list(growth=10,capture=0),
-      partial=list(growth=10,capture=50),
-      full=list(growth=10,capture=100))
-    x <- presets[[input$growth_scenario]]
-    updateNumericInput(session,"bandwidth_growth_rate",value=x$growth)
-    updateSliderInput(session,"revenue_capture_rate",value=x$capture)
-  },ignoreInit=FALSE)
-  output$growth_scenario_description <- renderUI({
-    descriptions <- list(
-      no_growth=list(title="No Growth",text="Bandwidth demand remains flat, so future revenue stays aligned with today's predicted revenue."),
-      demand_no_revenue=list(title="Demand Grows, Revenue Doesn't",text="Bandwidth consumption increases, but none of the incremental demand is converted into additional revenue."),
-      partial=list(title="Partial Monetization",text="Bandwidth demand increases and only part of the incremental demand becomes revenue. This is the default balanced scenario."),
-      full=list(title="Full Monetization",text="Bandwidth demand increases and all incremental demand is reflected in revenue growth."))
-    x<-descriptions[[input$growth_scenario]]
-    div(class="scenario-description",div(class="scenario-title",x$title),div(x$text))
+  output$positioning_context <- renderUI({
+    r <- scoring_result(); b <- model_bundle(); req(r, b); cr <- matched_class_result(); pc <- predicted_class()
+    tagList(
+      div(class = "note", paste("Predicted annual revenue", fmt_dollar(r$predicted_revenue), paste0("(model trained on ", tolower(b$training_label), ")"), "is compared with",
+                                sum(is.finite(r$comparable_facilities$Total_MRR_12M)), "matched GLMs and",
+                                sum(is.finite(b$historical_profile$Total_MRR_12M)), "eligible historical GLMs.",
+                                if (!is.na(pc)) paste0("It would be a ", pc, " performer in its segment (", fences_text(cr), ")") else "")),
+      if (!is.na(pc) && pc != "Medium")
+        div(class = "warning", paste0("The prediction lands in the ", pc, " class for this segment (top or bottom ", pct_label(tier_pct()), "): check the inputs and the drivers on the Model explanation tab before relying on it.")))
   })
-  future_growth_data <- reactive({r<-scoring_result();req(r);future_bandwidth_growth(r$predicted_revenue,r$input$Year_Build[[1]],input$growth_horizon_years,input$bandwidth_growth_rate/100,input$revenue_capture_rate/100)})
-  output$growth_current_revenue <- renderText({r<-scoring_result();req(r);fmt_dollar(r$predicted_revenue)})
-  output$growth_future_revenue <- renderText({d<-future_growth_data();if(nrow(d)) fmt_dollar(tail(d$Future_Revenue_Opportunity,1)) else "Unavailable"})
-  output$growth_incremental_revenue <- renderText({d<-future_growth_data();if(nrow(d)) fmt_dollar(tail(d$Incremental_Revenue_Opportunity,1)) else "Unavailable"})
-  output$growth_multiple <- renderText({d<-future_growth_data();if(nrow(d)) paste0(round(tail(d$Revenue_Growth_Index,1),2),"x") else "Unavailable"})
-  output$future_growth_plot <- renderPlot({d<-future_growth_data();validate(need(nrow(d)>0,"Valid revenue and growth assumptions are required."));ggplot(d,aes(Year,Future_Revenue_Opportunity))+geom_area(fill="#dbeafe",alpha=.65)+geom_line(linewidth=1.25,color="#0f6cbd")+geom_point(size=2.8,color="#0f6cbd")+geom_hline(yintercept=d$Future_Revenue_Opportunity[[1]],linetype=2,color="#667085")+scale_x_continuous(breaks=d$Year)+scale_y_continuous(labels=dollar)+labs(x=NULL,y="Annual revenue opportunity",title="Future bandwidth growth opportunity",subtitle="Current predicted revenue expanded by bandwidth-demand growth")+theme_minimal()})
-  output$future_growth_table <- renderDT({d<-future_growth_data();validate(need(nrow(d)>0,"Valid revenue and growth assumptions are required."));display<-d%>%transmute(Year,`Year from start`=Year_From_Start,`Bandwidth-demand index`=Bandwidth_Demand_Index,`Revenue capture rate`=Revenue_Capture_Rate,`Revenue growth index`=Revenue_Growth_Index,`Future revenue opportunity`=Future_Revenue_Opportunity,`Incremental opportunity`=Incremental_Revenue_Opportunity);datatable(display,rownames=FALSE,options=list(dom="t",ordering=FALSE,scrollX=TRUE))%>%formatRound(c("Bandwidth-demand index","Revenue growth index"),2)%>%formatPercentage("Revenue capture rate",digits=0)%>%formatCurrency(c("Future revenue opportunity","Incremental opportunity"),"$",digits=0)})
+  
+  observeEvent(input$cap_reset, {
+    updateNumericInput(session, "cap_ramp_y1", value = unname(capacity_ramp_default[["year1"]]))
+    updateNumericInput(session, "cap_ramp_y2", value = unname(capacity_ramp_default[["year2"]]))
+    updateNumericInput(session, "cap_ramp_mature", value = unname(capacity_ramp_default[["mature"]]))
+    updateNumericInput(session, "cap_density_pct", value = compute_density_increase_default * 100)
+    updateNumericInput(session, "cap_wave_price_pct", value = wave_price_change_default * 100)
+    updateNumericInput(session, "cap_wave_price_start", value = wave_price_start_default)
+    updateNumericInput(session, "cap_horizon", value = capacity_horizon_default)
+  }, ignoreInit = TRUE)
+  future_growth_data <- reactive({
+    r <- scoring_result(); req(r)
+    ramp <- c(input_number(input$cap_ramp_y1), input_number(input$cap_ramp_y2), input_number(input$cap_ramp_mature))
+    capacity_growth_outlook(r$predicted_revenue, r$input$Year_Build[[1]], input_number(input$cap_horizon),
+                            ramp, input_number(input$cap_density_pct) / 100, input_number(input$cap_wave_price_pct) / 100,
+                            input_number(input$cap_wave_price_start))
+  })
+  growth_need <- function(d) validate(need(nrow(d) > 0, "Enter a predicted revenue and valid capacity-factor assumptions (non-negative ramp factors and density rate, wave price change above -100%, starting wave price above $0, horizon of at least 1 year)."))
+  year_label <- function(d, i) if (is.finite(d$Calendar_Year[[i]])) paste0("Year ", d$Operating_Year[[i]], " (", d$Calendar_Year[[i]], ")") else paste("Year", d$Operating_Year[[i]])
+  output$cap_baseline_revenue <- renderText({ r <- scoring_result(); req(r); fmt_dollar(r$predicted_revenue) })
+  output$cap_year1_revenue <- renderText({ d <- future_growth_data(); if (nrow(d)) fmt_dollar(d$Revenue_Opportunity[[1]]) else "Unavailable" })
+  output$cap_mature_revenue <- renderText({
+    d <- future_growth_data(); if (!nrow(d)) return("Unavailable")
+    i <- which(d$Phase == "Mature")
+    if (!length(i)) "Not reached" else paste0(fmt_dollar(d$Revenue_Opportunity[[i[[1]]]]), " · ", year_label(d, i[[1]]))
+  })
+  output$cap_final_revenue <- renderText({
+    d <- future_growth_data(); if (!nrow(d)) return("Unavailable")
+    n <- nrow(d); paste0(fmt_dollar(d$Revenue_Opportunity[[n]]), " · ", formatC(d$Net_Revenue_Factor[[n]], format = "f", digits = 2), "×")
+  })
+  output$cap_cumulative_revenue <- renderText({ d <- future_growth_data(); if (nrow(d)) fmt_dollar(tail(d$Cumulative_Revenue, 1)) else "Unavailable" })
+  output$cap_pricing_impact <- renderText({
+    d <- future_growth_data(); if (!nrow(d)) return("Unavailable")
+    vol <- tail(d$Cumulative_Volume_Revenue, 1); impact <- tail(d$Cumulative_Revenue, 1) - vol
+    paste0(fmt_dollar(impact), if (is.finite(vol) && vol > 0) paste0(" · ", fmt_percent(impact / vol)) else "")
+  })
+  output$future_growth_plot <- renderPlot({
+    d <- future_growth_data(); growth_need(d); r <- scoring_result()
+    d <- d %>% mutate(Label = ifelse(is.finite(Calendar_Year), paste0("Y", Operating_Year, "\n", Calendar_Year), paste0("Y", Operating_Year)),
+                      Label = factor(Label, levels = Label))
+    ggplot(d, aes(Label, Revenue_Opportunity, fill = Phase)) +
+      geom_col(aes(y = Volume_Revenue), width = 0.7, fill = NA, color = "#98a2b3", linetype = 2) +
+      geom_col(width = 0.7) +
+      geom_text(aes(y = pmax(Revenue_Opportunity, Volume_Revenue), label = paste0(formatC(Net_Revenue_Factor, format = "f", digits = 2), "×")),
+                vjust = -0.5, size = 3.3, color = "#344054") +
+      geom_hline(yintercept = r$predicted_revenue, linetype = 2, color = "#667085") +
+      annotate("text", x = 0.6, y = r$predicted_revenue, label = paste("Predicted", fmt_dollar(r$predicted_revenue)),
+               vjust = -0.6, hjust = 0, size = 3.3, color = "#475467") +
+      scale_fill_manual(values = c(`Ramp-up` = "#9ec5fe", Mature = "#0f6cbd")) +
+      scale_y_continuous(labels = dollar, expand = expansion(mult = c(0, 0.12))) +
+      labs(x = NULL, y = "Annual revenue opportunity", fill = NULL,
+           title = "Revenue opportunity by operating year (with wave pricing)",
+           subtitle = "Solid bars: predicted revenue × capacity factor × wave price factor (net factor on the bars).\nDashed outline: revenue at constant wave pricing.") +
+      theme_minimal() + theme(legend.position = "bottom")
+  })
+  output$growth_baseline_note <- renderUI({
+    r <- scoring_result(); req(r)
+    div(class = "mini-compare",
+        span(class = "mc-title", "Baseline:"),
+        span(tags$strong("Predicted annual revenue "), fmt_dollar(r$predicted_revenue)),
+        span("= capacity factor 1.00 (a fully ramped site at today's compute density)."),
+        span("Each year's revenue = predicted × that year's capacity factor × wave price factor; 'Change vs predicted' = that revenue − predicted; 'Wave pricing impact' = that revenue − revenue at constant pricing."))
+  })
+  output$future_growth_table <- renderDT({
+    d <- future_growth_data(); growth_need(d); r <- scoring_result()
+    pred <- r$predicted_revenue
+    change_col <- paste0("Change vs predicted (", fmt_dollar(pred), ")")
+    baseline <- tibble(Year = "Predicted", `Calendar year` = NA_integer_, Phase = "Baseline (factor 1.00)",
+                       `Ramp factor` = NA_real_, `Compute density increase factor` = NA_real_,
+                       `Final yearly capacity factor` = 1, `Wave price factor` = 1, `Net revenue factor` = 1,
+                       `Predicted annual revenue` = pred, `Revenue at constant pricing` = pred,
+                       `Wave pricing impact` = 0, `Revenue opportunity` = pred, Change = 0, `Cumulative revenue` = NA_real_,
+                       `400G wave price ($/month)` = input_number(input$cap_wave_price_start),
+                       `400G wave equivalents` = pred / (input_number(input$cap_wave_price_start) * 12))
+    rows <- d %>% transmute(Year = as.character(Operating_Year), `Calendar year` = Calendar_Year, Phase,
+                            `Ramp factor` = Ramp_Factor, `Compute density increase factor` = Compute_Density_Factor,
+                            `Final yearly capacity factor` = Capacity_Factor, `Wave price factor` = Wave_Price_Factor,
+                            `Net revenue factor` = Net_Revenue_Factor, `Predicted annual revenue` = pred,
+                            `Revenue at constant pricing` = Volume_Revenue, `Wave pricing impact` = Pricing_Impact,
+                            `Revenue opportunity` = Revenue_Opportunity, Change = Change_vs_Predicted,
+                            `Cumulative revenue` = Cumulative_Revenue,
+                            `400G wave price ($/month)` = Wave_Price, `400G wave equivalents` = Wave_Equivalents)
+    tbl <- bind_rows(baseline, rows) %>%
+      select(Year, `Calendar year`, Phase,
+             # 1. Capacity: how much of the site is in use
+             `Predicted annual revenue`, `Ramp factor`, `Compute density increase factor`, `Final yearly capacity factor`,
+             # 2. Volume: 400G waves the site carries
+             `400G wave equivalents`,
+             # 3. Price per wave
+             `Wave price factor`, `400G wave price ($/month)`,
+             # 4. Revenue = waves x price x 12
+             `Net revenue factor`, `Revenue opportunity`,
+             # 5. Comparisons
+             `Revenue at constant pricing`, `Wave pricing impact`, Change, `Cumulative revenue`)
+    names(tbl)[names(tbl) == "Change"] <- change_col
+    datatable(tbl, rownames = FALSE, selection = "none", options = list(dom = "t", ordering = FALSE, scrollX = TRUE, pageLength = 50)) %>%
+      formatRound("Ramp factor", 2) %>% formatRound("Compute density increase factor", 6) %>%
+      formatRound(c("Final yearly capacity factor", "Wave price factor", "Net revenue factor"), 6) %>%
+      formatCurrency(c("Predicted annual revenue", "Revenue at constant pricing", "Wave pricing impact", "Revenue opportunity", change_col, "Cumulative revenue", "400G wave price ($/month)"), "$", digits = 0) %>%
+      formatRound("400G wave equivalents", 1) %>%
+      formatStyle(c("Final yearly capacity factor", "Net revenue factor"), fontWeight = "700") %>%
+      formatStyle("Wave pricing impact", color = styleInterval(c(-0.5, 0.5), c("#b42318", "#475467", "#067647"))) %>%
+      formatStyle(change_col, color = styleInterval(c(-0.5, 0.5), c("#b42318", "#475467", "#067647")), fontWeight = "700") %>%
+      formatStyle("Phase", color = styleEqual(c("Ramp-up", "Mature"), c("#175cd3", "#101828"))) %>%
+      formatStyle("Year", target = "row", backgroundColor = styleEqual("Predicted", "#eef4fb"), fontWeight = styleEqual("Predicted", "700"))
+  })
+
   output$revenue_peers_table <- renderDT({
     r<-scoring_result();b<-model_bundle();req(r,b);validate(need(is.finite(r$predicted_revenue),"Revenue prediction unavailable."))
     ref<-if(identical(input$revenue_peer_scope,"matched")) r$comparable_facilities else b$historical_profile
-    ref<-ref%>%transmute(GLM_ID,Location=paste(city,state,sep=", "),Segment=DC_Segments,`Annual Revenue`=Total_MRR_12M,`Facility Tenants`=derived_tenant_count,`Billed Customers`=Unique_Billing_Customer_Count_12M,`Size (sqft)`=SQ_foot,Capacity,`Build Year`=Year_Build,`Urban / Rural`=urban_rural,Proposed=FALSE)%>%filter(is.finite(`Annual Revenue`))
-    prop<-tibble(GLM_ID=r$input$GLM_ID[[1]],Location=paste(r$input$city[[1]],r$input$state[[1]],sep=", "),Segment=r$input$DC_Segments[[1]],`Annual Revenue`=r$predicted_revenue,`Facility Tenants`=r$anchors$tenants,`Billed Customers`=r$anchors$customers,`Size (sqft)`=r$input$SQ_foot[[1]],Capacity=r$input$Capacity[[1]],`Build Year`=r$input$Year_Build[[1]],`Urban / Rural`=r$input$urban_rural[[1]],Proposed=TRUE)
-    z<-bind_rows(ref,prop)%>%arrange(desc(`Annual Revenue`),GLM_ID)%>%mutate(Rank=min_rank(desc(`Annual Revenue`)));i<-which(z$Proposed);z<-z[max(1,i-10):min(nrow(z),i+10),]%>%transmute(Rank,Position=ifelse(Proposed,"PROPOSED SITE","Historical GLM"),GLM_ID,Location,Segment,`Annual Revenue`,`Facility Tenants`,`Billed Customers`,`Size (sqft)`,Capacity,`Build Year`,`Urban / Rural`)
-    datatable(z,rownames=FALSE,selection="none",options=list(dom="tip",pageLength=25,ordering=FALSE,scrollX=TRUE))%>%formatCurrency("Annual Revenue","$",digits=0)%>%formatRound(c("Facility Tenants","Billed Customers","Capacity"),1)%>%formatStyle("Position",target="row",backgroundColor=styleEqual("PROPOSED SITE","#e8f1fb"),fontWeight=styleEqual("PROPOSED SITE","700"))
+    ref<-ref%>%transmute(GLM_ID,Location=paste(city,state,sep=", "),Segment=DC_Segments,`Annual Revenue`=Total_MRR_12M,`Facility Tenants`=derived_tenant_count,`Billed Customers`=Unique_Billing_Customer_Count_12M,`Size (sqft)`=SQ_foot,Capacity,`Build Year`=Year_Build,`Bill Year`=bill_year_text(Bill_Year),`Urban / Rural`=urban_rural,Proposed=FALSE)%>%filter(is.finite(`Annual Revenue`))
+    prop<-tibble(GLM_ID=r$input$GLM_ID[[1]],Location=paste(r$input$city[[1]],r$input$state[[1]],sep=", "),Segment=r$input$DC_Segments[[1]],`Annual Revenue`=r$predicted_revenue,`Facility Tenants`=anchors_used()$tenants,`Billed Customers`=anchors_used()$customers,`Size (sqft)`=r$input$SQ_foot[[1]],Capacity=r$input$Capacity[[1]],`Build Year`=r$input$Year_Build[[1]],`Bill Year`="Proposed",`Urban / Rural`=r$input$urban_rural[[1]],Proposed=TRUE)
+    lk<-class_lookup();ref$Performer<-lk$Performer[match(ref$GLM_ID,lk$GLM_ID)];ref$Performer[is.na(ref$Performer)]<-"—";prop$Performer<-paste0(ifelse(is.na(predicted_class()),"—",predicted_class())," (predicted)")
+    z<-bind_rows(ref,prop)%>%arrange(desc(`Annual Revenue`),GLM_ID)%>%mutate(Rank=min_rank(desc(`Annual Revenue`)));i<-which(z$Proposed);z<-z[max(1,i-10):min(nrow(z),i+10),]%>%transmute(Rank,Position=ifelse(Proposed,"PROPOSED SITE","Historical GLM"),Performer,GLM_ID,Location,Segment,`Annual Revenue`,`Facility Tenants`,`Billed Customers`,`Size (sqft)`,Capacity,`Build Year`,`Bill Year`,`Urban / Rural`)
+    datatable(z,rownames=FALSE,selection="none",options=list(dom="tip",pageLength=25,ordering=FALSE,scrollX=TRUE))%>%formatCurrency("Annual Revenue","$",digits=0)%>%formatStyle("Performer",backgroundColor=styleEqual(names(class_colors),unname(class_colors)))%>%formatRound(c("Facility Tenants","Billed Customers","Capacity"),1)%>%formatStyle("Position",target="row",backgroundColor=styleEqual("PROPOSED SITE","#e8f1fb"),fontWeight=styleEqual("PROPOSED SITE","700"))
   })
   output$matched_average_summary <- renderUI({
     r <- scoring_result(); req(r); a <- averages()
     p(class = "context-note", paste0("Averages (", r$comparable_total, " matched GLMs): facility tenants ", fmt_count(a$Average[[1]]),
                                      " | normalized base ", fmt_count(a$Average[[2]]), " | billed customers ", fmt_count(a$Average[[3]]),
-                                     " | % billed ", fmt_percent(a$Average[[4]]), " | annual revenue ", fmt_dollar(a$Average[[5]]), "."))
+                                     " | % billed ", fmt_percent(a$Average[[4]]), " | annual revenue ", fmt_dollar(a$Average[[5]]),
+                                     " (all) / ", fmt_dollar(safe_mean(medium_revenue())), " (", length(medium_revenue()), " Medium only)."))
+  })
+  output$matched_order_summary <- renderUI({
+    r <- scoring_result(); req(r)
+    if (is.null(order_data())) {
+      note <- order_note()
+      return(p(class = "context-note", "Order comparison: load the optional order data in the sidebar to add new-order columns (comparison only; not a model input)."))
+    }
+    op <- order_period(); m <- matched_orders(); pf <- portfolio_orders()
+    has <- m$Order_Status == "Orders in period"
+    med_m <- safe_median(m$Orders_Pct_Revenue[has])
+    med_p <- safe_median(pf$Orders_Pct_Revenue[pf$Order_Status == "Orders in period"])
+    v <- m$Total_MRR_12M; ok <- is.finite(v)
+    rev_cov <- if (sum(v[ok]) > 0) sum(v[ok & has]) / sum(v[ok]) else NA_real_
+    tagList(
+      div(class = "mini-compare",
+          span(class = "mc-title", paste0("New orders, ", op$label, ":")),
+          span(tags$strong("With orders "), sum(has), " of ", nrow(m)),
+          span(tags$strong("No orders in period "), sum(m$Order_Status == "No orders in period")),
+          span(tags$strong("Not in extract "), sum(m$Order_Status == "Not in order extract")),
+          span(tags$strong("Revenue covered "), fmt_percent(rev_cov)),
+          span(tags$strong("Combined annual rate "), fmt_dollar(sum(m$Annual_Order_Rate, na.rm = TRUE))),
+          span(tags$strong("Median orders % of revenue "), fmt_percent(med_m), " matched vs ", fmt_percent(med_p), " portfolio")),
+      p(class = "context-note", paste0("New orders (annual rate) = average new-order MRR (MRR_NET_SALES) booked per month in the chosen period × 12 months of bookings × 12 months of billing: the annual revenue value of a typical year's new orders, so any period compares with annual billed revenue (", revenue_window, "). Orders % of revenue = that rate ÷ annual billed revenue: how fast the site is adding business. 'No orders in period' = in the extract but no orders in those months ($0); 'Not in order extract' = no order data (blank). Comparison only: not used in the model, matching or performer classes.")))
   })
   output$average_samples_table <- renderDT({
     a <- averages()
     display <- a %>% mutate(Average = c(fmt_count(a$Average[[1]]), fmt_count(a$Average[[2]]),
                                         fmt_count(a$Average[[3]]), fmt_percent(a$Average[[4]]), fmt_dollar(a$Average[[5]]))) %>%
       rename(`Valid GLMs (n)` = Valid_GLMS, `Matched GLMs` = Matched_GLMS)
+    med <- medium_revenue()
+    display <- bind_rows(display, tibble(Measure = "Annual revenue (Medium performers only)",
+                                         Average = if (length(med)) fmt_dollar(mean(med)) else "Unavailable",
+                                         `Valid GLMs (n)` = length(med), `Matched GLMs` = nrow(matched_classified())))
     datatable(display, rownames = FALSE, options = list(dom = "t", ordering = FALSE, scrollX = TRUE))
   })
-  output$size_anchor <- renderText({ r <- scoring_result(); req(r); fmt_dollar(r$anchors$revenue) })
-  output$tenant_anchor <- renderText({ r <- scoring_result(); req(r); fmt_count(r$anchors$tenants) })
-  output$customer_anchor <- renderText({ r <- scoring_result(); req(r); fmt_count(r$anchors$customers) })
+  output$size_anchor <- renderText(fmt_dollar(anchors_used()$revenue))
+  output$tenant_anchor <- renderText(fmt_count(anchors_used()$tenants))
+  output$customer_anchor <- renderText(fmt_count(anchors_used()$customers))
   output$blended_annual <- renderText({
     r <- scoring_result(); req(r)
-    paste(fmt_dollar(r$anchors$blended_annual_per_customer), "| n =", r$anchors$blended_n)
+    paste(fmt_dollar(anchors_used()$blended_annual_per_customer), "| n =", anchors_used()$blended_n)
   })
   output$anchor_notes <- renderUI({
-    r <- scoring_result(); req(r); a <- r$anchors
-    p(class = "context-note", paste("Size-adjusted means: per-site value / sqft × proposed sqft; sizes 0.5–2× proposed.",
+    r <- scoring_result(); req(r); a <- anchors_used()
+    p(class = "context-note", paste("Medium matched sites only (High / Low excluded). Size-adjusted means: per-site value / sqft × proposed sqft; sizes 0.5–2× proposed.",
                                     "Samples: revenue", a$revenue_n, "| tenants", a$tenants_n, "| constrained customers", a$customers_n,
                                     ". Customer reference requires billed customers ≤ facility tenant estimate; it is not a forecast or the % billed denominator."))
   })
   output$anchor_trace <- renderDT({
     r <- scoring_result(); req(r)
-    datatable(r$anchors$trace, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE)) %>%
+    datatable(anchors_used()$trace, rownames = FALSE, options = list(pageLength = 10, scrollX = TRUE)) %>%
       formatCurrency(c("Observed_12M_Revenue", "Size_Adjusted_Revenue"), "$", digits = 0) %>%
-      formatRound(c("Size_Adjusted_Tenants", "Size_Adjusted_Customers"), 1)
+      formatRound("Size_Adjusted_Tenants", 1) %>%
+      formatRound("Historical_Penetration", 3)
   })
   output$quote_table <- renderDT({
     r <- scoring_result(); req(r)
@@ -1431,7 +2465,7 @@ server <- function(input, output, session) {
   })
   output$quote_site_table <- renderDT({
     r <- scoring_result(); req(r)
-    r$comparable_facilities %>% transmute(GLM_ID,
+    r$comparable_facilities %>% transmute(GLM_ID, `Bill year` = bill_year_text(Bill_Year),
                                           `Raw quoted categories` = Quote_Raw,
                                           `Unique category mentions` = vapply(Quote_Tokens, paste, character(1), collapse = " | "),
                                           `Aggregate site quote count` = QuoteCount_Last_12Months) %>%
@@ -1440,8 +2474,47 @@ server <- function(input, output, session) {
   output$comparable_compact <- renderDT({
     r<-scoring_result();req(r);validate(need(nrow(r$comparable_facilities)>0,"No comparable GLMs in this segment."))
     short<-function(x){if(!length(x)) return("No recorded detail");paste(head(x,2),collapse=", ")}
-    d<-r$comparable_facilities%>%transmute(`GLM / Site`=if_else(!is.na(DC_Operator)&nzchar(DC_Operator),paste(GLM_ID,DC_Operator,sep=" | "),GLM_ID),Location=paste(city,state,sep=", "),Segment=DC_Segments,`Match Score`=Comparable_Score,`Annual Revenue`=Total_MRR_12M,`Facility Tenants`=derived_tenant_count,`Billed Customers`=Unique_Billing_Customer_Count_12M,`Size (sqft)`=SQ_foot,Capacity,CAPEX,`Build Year`=Year_Build,`Urban / Rural`=urban_rural,`Quoted Offerings`=vapply(Quote_Tokens,short,character(1)))
-    datatable(d,rownames=FALSE,class="compact stripe hover",selection="single",options=list(dom="ftip",pageLength=10,scrollX=TRUE,order=list(list(3,"asc"))))%>%formatCurrency(c("Annual Revenue","CAPEX"),"$",digits=0)%>%formatStyle("Match Score",backgroundColor=styleInterval(c(.3,.8),c("#d1fae5","#fef3c7","#fee2e2")),fontWeight="600")%>%formatRound(c("Facility Tenants","Billed Customers","Capacity"),1)%>%formatRound("Match Score",3)%>%formatRound("Size (sqft)",0)
+    has_orders<-!is.null(order_data())
+    d<-matched_orders()%>%transmute(`GLM / Site`=if_else(!is.na(DC_Operator)&nzchar(DC_Operator),paste(GLM_ID,DC_Operator,sep=" | "),GLM_ID),Performer=as.character(Performer_Class),Location=paste(city,state,sep=", "),Segment=DC_Segments,`Match Score`=Comparable_Score,`Annual Revenue`=Total_MRR_12M,`New Orders (annual rate)`=Annual_Order_Rate,`Orders % of Revenue`=Orders_Pct_Revenue,`Order Status`=Order_Status,`On-net date`=ifelse(is.na(Onnet_Date),"Missing",format(Onnet_Date,"%Y-%m-%d")),`Years on-net`=Years_Onnet,`Bill Year`=bill_year_text(Bill_Year),`Facility Tenants`=derived_tenant_count,`Billed Customers`=Unique_Billing_Customer_Count_12M,`Size (sqft)`=SQ_foot,Capacity,CAPEX,`Build Year`=Year_Build,`Urban / Rural`=urban_rural,`Quoted Offerings`=vapply(Quote_Tokens,short,character(1)))
+    if(!has_orders) d<-d%>%select(-`New Orders (annual rate)`,-`Orders % of Revenue`,-`Order Status`)
+    dt<-datatable(d,rownames=FALSE,class="compact stripe hover",selection="single",options=list(dom="ftip",pageLength=10,scrollX=TRUE,order=list(list(4,"asc"))))
+    if(has_orders) dt<-dt%>%formatCurrency("New Orders (annual rate)","$",digits=0)%>%formatPercentage("Orders % of Revenue",1)%>%
+      formatStyle("Order Status",color=styleEqual(c("Orders in period","No orders in period","Not in order extract"),c("#067647","#b54708","#667085")),fontWeight="600")
+    dt%>%formatCurrency(c("Annual Revenue","CAPEX"),"$",digits=0)%>%formatRound("Years on-net",1)%>%formatStyle("Performer",backgroundColor=styleEqual(names(class_colors),unname(class_colors)),fontWeight="700")%>%formatStyle("Match Score",backgroundColor=styleInterval(c(.3,.8),c("#d1fae5","#fef3c7","#fee2e2")),fontWeight="600")%>%formatRound(c("Facility Tenants","Billed Customers","Capacity"),1)%>%formatRound("Match Score",3)%>%formatRound("Size (sqft)",0)
+  })
+  output$match_score_summary <- renderUI({
+    r <- scoring_result(); req(r); m <- r$comparable_facilities
+    x <- m$Comparable_Score[is.finite(m$Comparable_Score)]
+    req(length(x) > 0)
+    band <- cut(x, c(-Inf, 0.3, 0.8, Inf), labels = c("close", "fair", "weak"), right = FALSE)
+    div(class = "mini-compare",
+        span(class = "mc-title", "Match scores in this match:"),
+        span(tags$strong("Range "), formatC(min(x), format = "f", digits = 3), " – ", formatC(max(x), format = "f", digits = 3)),
+        span(tags$strong("Median "), formatC(stats::median(x), format = "f", digits = 3)),
+        span(tags$strong("Close (<0.3) "), sum(band == "close")),
+        span(tags$strong("Fair (0.3–0.8) "), sum(band == "fair")),
+        span(tags$strong("Weak (>0.8) "), sum(band == "weak")),
+        span("Lower = more physically similar to the proposed site."))
+  })
+  output$match_score_bands <- renderDT({
+    tibble(Colour = c("Green", "Yellow", "Red"), `Match Score` = c("Below 0.3", "0.3 to 0.8", "Above 0.8"),
+           Meaning = c("Close match", "Reasonable match", "Weak match"),
+           `Roughly equivalent to` = c("Within about 1.35× the size, similar power, same urban/rural type",
+                                       "About 1.35× to 2.2× the size, or a power / urban-rural difference",
+                                       "More than about 2.2× the size, or size and other differences combined")) %>%
+      datatable(rownames = FALSE, selection = "none", options = list(dom = "t", ordering = FALSE)) %>%
+      formatStyle("Colour", target = "row", backgroundColor = styleEqual(c("Green", "Yellow", "Red"), c("#d1fae5", "#fef3c7", "#fee2e2")))
+  })
+  output$match_score_reference <- renderDT({
+    ratio <- c(1, 1.1, 1.25, 1.5, 2, 3, 4)
+    tibble(`Site size vs proposed` = paste0(ratio, "× bigger or ", ratio, "× smaller"),
+           `Size distance` = abs(log(ratio)),
+           `Score with same power & type` = abs(log(ratio))) %>%
+      mutate(`Site size vs proposed` = ifelse(ratio == 1, "Same size", `Site size vs proposed`)) %>%
+      datatable(rownames = FALSE, selection = "none", options = list(dom = "t", ordering = FALSE)) %>%
+      formatRound(c("Size distance", "Score with same power & type"), 3) %>%
+      formatStyle("Score with same power & type",
+                  backgroundColor = styleInterval(c(0.3, 0.8), c("#d1fae5", "#fef3c7", "#fee2e2")))
   })
   output$selected_glm_record <- renderDT({
     r <- scoring_result(); req(r)
@@ -1493,7 +2566,7 @@ server <- function(input, output, session) {
   })
   output$actual_predicted_plot <- renderPlot({
     b <- model_bundle(); req(b)
-    validate(need(nrow(b$test_results) > 0, "Browser historical revenue model unavailable; physical comparables still work."))
+    validate(need(nrow(b$test_results) > 0, "Secondary historical model unavailable; physical comparables still work."))
     ggplot(b$test_results, aes(Actual_Revenue, Predicted_Revenue)) + geom_point(alpha = 0.6, color = "#0f6cbd") +
       geom_abline(slope = 1, intercept = 0, linetype = 2) + scale_x_continuous(labels = dollar) +
       scale_y_continuous(labels = dollar) + labs(x = "Actual observed 12M all-product revenue", y = "Predicted 12M all-product revenue") + theme_minimal()
@@ -1532,6 +2605,7 @@ server <- function(input, output, session) {
     b <- model_bundle(); req(b)
     b$historical_profile %>% transmute(GLM_ID, State = state, City = city, Segment = DC_Segments,
                                        `Build year (raw)` = Year_Build_Raw, `Parsed build year` = Year_Build,
+                                       `Bill year` = bill_year_text(Bill_Year),
                                        `Observed 12M all-product revenue` = Total_MRR_12M, `Sqft` = SQ_foot, Capacity,
                                        `CAPEX input` = CAPEX, `Source TAM 2030` = Historical_TAM_2030,
                                        `Calculated TAM 2030` = Calculated_Historical_TAM_2030,
@@ -1540,7 +2614,7 @@ server <- function(input, output, session) {
                                        `10-year SOM` = Calculated_Historical_SOM_10_Year,
                                        NPV = Calculated_Historical_NPV, IRR = Calculated_Historical_IRR) %>%
       datatable(rownames = FALSE, filter = "top", options = list(pageLength = 10, scrollX = TRUE)) %>%
-      formatCurrency(c("Observed 12M all-product revenue", "CAPEX input", "Source TAM 2030", "Calculated TAM 2030", "CAPEX", "10-year TAM", "10-year gross revenue", "10-year SOM", "NPV"), "$", digits = 0) %>%
+      formatCurrency(c("Observed 12M all-product revenue", "CAPEX input", "Source TAM 2030", "Calculated TAM 2030", "4MC CAPEX", "10-year TAM", "10-year gross revenue", "10-year SOM", "NPV"), "$", digits = 0) %>%
       formatPercentage("IRR", digits = 1)
   })
   
@@ -1553,14 +2627,18 @@ server <- function(input, output, session) {
                   "Valid-segment GLMs with missing revenue excluded", "Unknown/non-numeric build year",
                   "Unknown/nonpositive physical size", "Billed / normalized-base ratios above 100%",
                   "Unavailable billed / normalized-base ratio", "Billed counts above facility tenant estimates",
-                  "GLMs without recorded quote detail", "Browser-model training rows"),
+                  "GLMs without recorded quote detail", "Secondary training rows",
+                  "Missing / unparseable on-net date", "On-net date after revenue window end",
+                  "Missing CAPEX (historical 4MC financials unavailable)"),
       Count = c(b$raw_rows, ncol(b$raw_source), b$onnet_rows, nrow(b$historical_profile), b$excluded_segment_rows,
                 b$duplicate_rows, sum(p$DC_Segments %in% valid_segments & is.finite(p$Total_MRR_12M) & p$Total_MRR_12M < minimum_revenue),
                 sum(p$DC_Segments %in% valid_segments & !is.finite(p$Total_MRR_12M)),
                 sum(!is.finite(p$Year_Build)), sum(!is.finite(p$SQ_foot) | p$SQ_foot <= 0), sum(p$Normalized_Base_Conflict),
                 sum(!is.finite(p$Billed_Percent_Normalized)), sum(p$Count_Conflict),
-                sum(lengths(p$Quote_Tokens) == 0), b$eligible_rows))
-    datatable(quality, rownames = FALSE, options = list(dom = "t", ordering = FALSE))
+                sum(lengths(p$Quote_Tokens) == 0), b$eligible_rows,
+                sum(is.na(p$Onnet_Date)), sum(!is.na(p$Onnet_Date) & p$Onnet_Date > revenue_window_end),
+                sum(!is.finite(p$CAPEX))))
+    datatable(quality, rownames = FALSE, options = list(dom = "t", ordering = FALSE, pageLength = 25))
   })
   output$matched_quality_table <- renderDT({
     r <- scoring_result(); req(r); p <- r$comparable_facilities
@@ -1569,6 +2647,262 @@ server <- function(input, output, session) {
                       Count = c(nrow(p), sum(!is.finite(p$Billed_Percent_Normalized)), sum(p$Normalized_Base_Conflict),
                                 sum(!is.finite(p$SQ_foot) | p$SQ_foot <= 0), sum(p$Count_Conflict), sum(lengths(p$Quote_Tokens) == 0)))
     datatable(quality, rownames = FALSE, options = list(dom = "t", ordering = FALSE))
+  })
+
+  # Performance ranking (unified classes), prediction drivers and model example sites
+  proposed_perf <- reactive(proposed_class_info())
+  influence <- reactive({
+    r <- scoring_result(); b <- model_bundle(); req(r, b)
+    model_influence(b, r, tiers(), top_n = 5L, same_segment_only = FALSE)
+  })
+  drivers <- reactive({ r <- scoring_result(); b <- model_bundle(); req(r, b); prediction_breakdown(b, r) })
+  fmt_ratio <- function(x) ifelse(is.finite(x), paste0(formatC(x, format = "f", digits = 2), "×"), "Unavailable")
+  class_badge <- function(x) if (is.null(x) || is.na(x)) "Unavailable" else span(class = paste("class-badge", tolower(x)), style = "font-size:22px;padding:4px 14px;", x)
+
+  output$perf_class <- renderUI({
+    pp <- proposed_perf()
+    tagList(div(style = "margin-top:8px;", class_badge(pp$tier)),
+            div(class = "metric-subtitle", paste0("Predicted ", fmt_dollar(pp$revenue), " vs Segment ", pp$segment, " limits")))
+  })
+  output$perf_p_revenue <- renderText(fmt_percent(proposed_perf()$percentile))
+  output$perf_segment_rank <- renderText({ pp <- proposed_perf(); if (is.finite(pp$segment_rank)) paste(pp$segment_rank, "of", pp$segment_n + 1L) else "Unavailable" })
+  output$perf_p_productivity <- renderText({ pp <- proposed_perf(); paste(fmt_percent(pp$p_rev_sqft), "|", fmt_percent(pp$p_rev_mw)) })
+  output$perf_context <- renderUI({
+    pp <- proposed_perf(); cr <- matched_class_result()
+    tagList(
+      div(class = "note", paste0(
+        "Predicted ", fmt_dollar(pp$revenue), " | ",
+        if (is.finite(pp$rev_per_sqft)) dollar(pp$rev_per_sqft, accuracy = 0.01) else "Unavailable", " per sqft | ",
+        fmt_dollar(pp$rev_per_mw), " per MW, compared with ", comma(pp$segment_n), " Segment ", pp$segment, " sites. ",
+        fences_text(cr))),
+      if (pp$segment_n < 20)
+        div(class = "warning", paste0("Segment ", pp$segment, " has only ", pp$segment_n, " sites with revenue; percentiles and class limits are coarse.")))
+  })
+  output$perf_bucket_summary <- renderDT({
+    t <- tiers(); r <- scoring_result()
+    seg <- if (!is.null(r)) r$input$DC_Segments[[1]] else NULL
+    matched_ids <- if (!is.null(r)) r$comparable_facilities$GLM_ID else character()
+    matched_only <- identical(input$class_profile_scope, "matched") && length(matched_ids)
+    pool <- if (matched_only) t %>% filter(GLM_ID %in% matched_ids) else if (is.null(seg)) t else t %>% filter(DC_Segments == seg)
+    pc <- if (!is.null(r)) proposed_perf()$tier else NA_character_
+    summary <- pool %>% filter(Tier != "Unclassified") %>% mutate(Tier = factor(as.character(Tier), levels = class_levels)) %>%
+      group_by(Tier, .drop = FALSE) %>%
+      summarise(Sites = n(), `Matched sites` = sum(GLM_ID %in% matched_ids),
+                `Revenue range` = if (n()) paste(fmt_dollar(min(Revenue, na.rm = TRUE)), "-", fmt_dollar(max(Revenue, na.rm = TRUE))) else "—",
+                `Median annual revenue` = safe_median(Revenue), `Median revenue / sqft` = safe_median(Rev_per_SQFT),
+                `Median revenue / MW` = safe_median(Rev_per_MW), `Median sqft` = safe_median(SQ_foot),
+                `Median power` = safe_median(Capacity), `Median billed customers` = safe_median(Unique_Billing_Customer_Count_12M),
+                `Top states` = if (n()) paste(head(names(sort(table(state), decreasing = TRUE)), 3), collapse = ", ") else "—",
+                .groups = "drop") %>%
+      filter(Tier != "Unclassified") %>%
+      mutate(Class = as.character(Tier), `Proposed site` = ifelse(!is.na(pc) & Class == pc, "◀ PROPOSED", "")) %>%
+      select(Class, everything(), -Tier)
+    if (matched_only) summary <- summary %>% select(-`Matched sites`) %>% rename(`Matched sites` = Sites)
+    datatable(summary, rownames = FALSE, options = list(dom = "t", ordering = FALSE, scrollX = TRUE)) %>%
+      formatCurrency(c("Median annual revenue", "Median revenue / MW"), "$", digits = 0) %>%
+      formatCurrency("Median revenue / sqft", "$", digits = 2) %>%
+      formatRound(c("Median sqft", "Median power", "Median billed customers"), 0) %>%
+      formatStyle("Class", backgroundColor = styleEqual(names(class_colors), unname(class_colors)), fontWeight = "700") %>%
+      formatStyle("Proposed site", target = "row", backgroundColor = styleEqual("◀ PROPOSED", "#e8f1fb"))
+  })
+  output$class_profile_note <- renderUI({
+    r <- scoring_result(); req(r); pp <- proposed_perf()
+    txt <- if (identical(input$class_profile_scope, "matched"))
+      paste0("Showing only the ", nrow(r$comparable_facilities), " matched data centers, grouped by their Segment ", pp$segment, " class.")
+    else paste0("Showing all ", comma(pp$segment_n), " Segment ", pp$segment, " sites in the portfolio; 'Matched sites' counts how many of your matches fall in each class.")
+    p(class = "context-note", txt, " Proposed site (predicted): ", fmt_dollar(pp$revenue), " | ",
+      if (is.finite(pp$rev_per_sqft)) dollar(pp$rev_per_sqft, accuracy = 0.01) else "—", " per sqft | ",
+      fmt_dollar(pp$rev_per_mw), " per MW.")
+  })
+  output$perf_plot <- renderPlot({
+    r <- scoring_result(); req(r); pp <- proposed_perf(); m <- matched_classified(); p <- tier_pct() / 100
+    if (identical(input$perf_plot_scope, "portfolio")) {
+      seg_df <- tiers() %>% filter(DC_Segments == pp$segment, is.finite(Revenue), Revenue > 0) %>%
+        mutate(Class = factor(as.character(Tier), levels = c("High", "Medium", "Low")))
+      validate(need(nrow(seg_df) > 0, "No sites in this segment."))
+      matched_rev <- m$Total_MRR_12M[is.finite(m$Total_MRR_12M) & m$Total_MRR_12M > 0]
+      g <- ggplot(seg_df, aes(x = Revenue, fill = Class)) +
+        geom_histogram(bins = 45, color = "white", linewidth = 0.2) +
+        scale_x_log10(labels = function(x) dollar(x, accuracy = 1)) +
+        scale_fill_manual(values = c(High = "#12b76a", Medium = "#9ec5fe", Low = "#f04438"), drop = FALSE)
+      limits <- c(pp$lower, pp$upper); limits <- limits[is.finite(limits) & limits > 0]
+      if (length(limits)) g <- g + geom_vline(xintercept = limits, linetype = 3, color = "#475467")
+      if (length(matched_rev))
+        g <- g + geom_rug(data = tibble(Revenue = matched_rev), aes(x = Revenue), inherit.aes = FALSE,
+                          color = "#101828", linewidth = 0.9, length = grid::unit(0.05, "npc"))
+      if (is.finite(pp$revenue) && pp$revenue > 0)
+        g <- g + geom_vline(xintercept = pp$revenue, color = "#7f56d9", linewidth = 1.3) +
+          annotate("label", x = pp$revenue, y = Inf, vjust = 1.3, fill = "#f4f0ff", color = "#53389e",
+                   label = paste0("Proposed ", fmt_dollar(pp$revenue), " | ", fmt_percent(pp$percentile), " percentile | ",
+                                  ifelse(is.na(pp$tier), "—", pp$tier)))
+      return(g + labs(x = "Annual revenue (log scale)", y = "Number of sites", fill = NULL,
+                      title = paste0("All ", comma(nrow(seg_df)), " Segment ", pp$segment, " sites by annual revenue"),
+                      subtitle = "Bars coloured by class; dotted lines = class limits; black ticks along the bottom = your matched sites; purple line = proposed site") +
+               theme_minimal() + theme(legend.position = "bottom"))
+    }
+    plot_df <- bind_rows(
+      m %>% transmute(Label = GLM_ID, Percentile = Revenue_Percentile, Class = as.character(Performer_Class)),
+      tibble(Label = paste0(r$input$GLM_ID[[1]], " (PROPOSED)"), Percentile = pp$percentile, Class = "Proposed")) %>%
+      filter(is.finite(Percentile)) %>% arrange(Percentile) %>% mutate(Label = factor(Label, levels = unique(Label)))
+    validate(need(nrow(plot_df) > 0, "No revenue percentiles available."))
+    ggplot(plot_df, aes(x = Percentile, y = Label)) +
+      annotate("rect", xmin = 1 - p, xmax = 1, ymin = -Inf, ymax = Inf, fill = "#ecfdf3", alpha = 0.8) +
+      annotate("rect", xmin = 0, xmax = p, ymin = -Inf, ymax = Inf, fill = "#fef3f2", alpha = 0.8) +
+      geom_vline(xintercept = c(p, 1 - p), linetype = 3, color = "#98a2b3") +
+      geom_segment(aes(x = 0, xend = Percentile, yend = Label), color = "#d0d5dd") +
+      geom_point(aes(color = Class, shape = Class == "Proposed"), size = 3.6) +
+      scale_color_manual(values = class_point_colors, breaks = c("High", "Medium", "Low", "Proposed")) +
+      scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+      scale_x_continuous(labels = percent, limits = c(0, 1)) +
+      labs(x = paste0("Annual revenue percentile within Segment ", pp$segment, " (higher is better)"), y = NULL, color = NULL,
+           title = "Matched data centers and the proposed site within their segment",
+           subtitle = paste0("Shaded bands: bottom ", pct_label(tier_pct()), " = Low, top ", pct_label(tier_pct()), " = High")) +
+      theme_minimal() + theme(legend.position = "bottom")
+  })
+  rank_columns <- function(d) {
+    d %>% transmute(Class = as.character(Tier), `Segment rank` = paste(Segment_Rank, "of", Segment_Sites),
+                    GLM_ID, Operator = DC_Operator, Location = paste(city, state, sep = ", "), Segment = DC_Segments,
+                    `Annual Revenue` = Revenue, `Revenue pct (segment)` = Revenue_Percentile,
+                    `Revenue / sqft` = Rev_per_SQFT, `Rev/sqft pct` = P_Rev_SQFT,
+                    `Revenue / MW` = Rev_per_MW, `Rev/MW pct` = P_Rev_MW,
+                    Sqft = SQ_foot, Power = Capacity, `Billed customers` = Unique_Billing_Customer_Count_12M,
+                    `Years on-net` = Years_Onnet, `Bill year` = bill_year_text(Bill_Year), `State rank` = paste(State_Rank, "of", State_Sites))
+  }
+  format_rank_table <- function(dt) {
+    dt %>%
+      formatCurrency(c("Annual Revenue", "Revenue / MW"), "$", digits = 0) %>%
+      formatCurrency("Revenue / sqft", "$", digits = 2) %>%
+      formatRound(c("Sqft", "Power", "Billed customers"), 0) %>% formatRound("Years on-net", 1) %>%
+      formatPercentage(c("Revenue pct (segment)", "Rev/sqft pct", "Rev/MW pct"), 0) %>%
+      formatStyle("Class", backgroundColor = styleEqual(names(class_colors), unname(class_colors)), fontWeight = "700")
+  }
+  output$perf_matched_table <- renderDT({
+    r <- scoring_result(); req(r); t <- tiers(); pp <- proposed_perf(); inp <- r$input
+    proposed_label <- paste(inp$GLM_ID[[1]], "(PROPOSED)")
+    proposed_row <- tibble(
+      Class = paste0(ifelse(is.na(pp$tier), "—", pp$tier), " (predicted)"),
+      `Segment rank` = if (is.finite(pp$segment_rank)) paste(pp$segment_rank, "of", pp$segment_n + 1L) else "—",
+      GLM_ID = proposed_label, Operator = "", Location = paste(inp$city[[1]], inp$state[[1]], sep = ", "),
+      Segment = inp$DC_Segments[[1]], `Annual Revenue` = pp$revenue, `Revenue pct (segment)` = pp$percentile,
+      `Revenue / sqft` = pp$rev_per_sqft, `Rev/sqft pct` = pp$p_rev_sqft, `Revenue / MW` = pp$rev_per_mw,
+      `Rev/MW pct` = pp$p_rev_mw, Sqft = inp$SQ_foot[[1]], Power = inp$Capacity[[1]],
+      `Billed customers` = anchors_used()$customers, `Years on-net` = NA_real_, `Bill year` = "Proposed", `State rank` = "—")
+    bind_rows(proposed_row, rank_columns(t %>% filter(GLM_ID %in% r$comparable_facilities$GLM_ID))) %>%
+      arrange(desc(`Annual Revenue`)) %>%
+      datatable(rownames = FALSE, selection = "none", options = list(dom = "ftip", pageLength = 30, scrollX = TRUE)) %>%
+      format_rank_table() %>%
+      formatStyle("GLM_ID", target = "row", fontWeight = styleEqual(proposed_label, "700"),
+                  backgroundColor = styleEqual(proposed_label, "#e8f1fb"))
+  })
+  output$perf_portfolio_table <- renderDT({
+    t <- tiers(); r <- scoring_result()
+    matched_ids <- if (!is.null(r)) r$comparable_facilities$GLM_ID else character()
+    t %>% arrange(DC_Segments, Segment_Rank) %>% rank_columns() %>%
+      mutate(Matched = GLM_ID %in% matched_ids) %>%
+      datatable(rownames = FALSE, filter = "top", selection = "none", options = list(pageLength = 15, scrollX = TRUE)) %>%
+      format_rank_table()
+  })
+
+  # Prediction drivers
+  output$drv_baseline <- renderText({ d <- drivers(); if (isTRUE(d$available)) fmt_dollar(d$baseline) else "Unavailable" })
+  output$drv_prediction <- renderText({ d <- drivers(); if (isTRUE(d$available)) fmt_dollar(d$prediction) else "Unavailable" })
+  split_driver <- function(x) {
+    flag <- grepl("\\(not seen in training\\)", x)
+    x <- trimws(sub("\\(not seen in training\\)", "", x))
+    parts <- regmatches(x, regexpr(":", x), invert = TRUE)[[1]]
+    list(name = trimws(parts[[1]]), value = if (length(parts) > 1) trimws(parts[[2]]) else "", flag = flag)
+  }
+  signed_dollar <- function(x) paste0(ifelse(x >= 0, "+", "−"), fmt_dollar(abs(x)))
+  driver_card <- function(d, up) {
+    if (!isTRUE(d$available)) return(div(class = "driver-headline", "Unavailable"))
+    t <- d$table %>% filter(if (up) Multiplier > 1 else Multiplier < 1)
+    if (!nrow(t)) return(div(class = "driver-headline", "None"))
+    t <- if (up) t[which.max(t$Multiplier), ] else t[which.min(t$Multiplier), ]
+    p <- split_driver(t$Driver)
+    tagList(div(class = "driver-headline", paste0(p$name, ": ", p$value)),
+            div(class = "driver-sub", span(class = paste("driver-mult", if (up) "up" else "down"), fmt_ratio(t$Multiplier)),
+                signed_dollar(t$Dollar_Change), " to the prediction"))
+  }
+  output$drv_top_up <- renderUI(driver_card(drivers(), TRUE))
+  output$drv_top_down <- renderUI(driver_card(drivers(), FALSE))
+  output$drv_note <- renderUI({
+    d <- drivers(); r <- scoring_result()
+    if (!isTRUE(d$available)) return(div(class = "warning", d$message))
+    t <- d$table
+    arrow <- function() span(class = "flow-arrow", "→")
+    steps <- lapply(seq_len(nrow(t)), function(i) {
+      p <- split_driver(t$Driver[[i]])
+      up <- t$Multiplier[[i]] >= 1
+      tagList(arrow(),
+              div(class = paste("flow-step", if (up) "up" else "down"),
+                  div(class = "flow-label", p$name),
+                  div(class = "flow-value", p$value),
+                  div(class = "flow-delta", paste0(fmt_ratio(t$Multiplier[[i]]), "  ", signed_dollar(t$Dollar_Change[[i]]))),
+                  div(class = "flow-total", paste("Running total", fmt_dollar(t$Running_Total[[i]]))),
+                  if (p$flag) div(class = "flow-flag", "Not seen in training")))
+    })
+    tagList(
+      div(class = "driver-flow",
+          div(class = "flow-step start", div(class = "flow-label", "Typical site"), div(class = "flow-value", fmt_dollar(d$baseline)),
+              div(class = "flow-total", "Portfolio starting point")),
+          steps, arrow(),
+          div(class = "flow-step end", div(class = "flow-label", "Predicted revenue"), div(class = "flow-value", fmt_dollar(d$prediction)),
+              div(class = "flow-total", "For the proposed site"))),
+      p(class = "context-note", "Green steps raise the prediction, red steps lower it. Steps are ordered largest effect first; each multiplier applies to the running total."),
+      if (length(r$unknown_model_levels))
+        div(class = "warning", paste("Not seen in training (treated as 'none of the known values'):",
+                                     paste(r$unknown_model_levels, collapse = ", "))))
+  })
+  output$drv_plot <- renderPlot({
+    d <- drivers(); validate(need(isTRUE(d$available), d$message))
+    t <- d$table %>% mutate(Direction = ifelse(Dollar_Change >= 0, "Raises prediction", "Lowers prediction"),
+                            Driver = factor(Driver, levels = rev(Driver)))
+    ggplot(t, aes(Dollar_Change, Driver, fill = Direction)) + geom_col() +
+      geom_vline(xintercept = 0, color = "#667085") +
+      scale_fill_manual(values = c(`Raises prediction` = "#12b76a", `Lowers prediction` = "#f04438")) +
+      scale_x_continuous(labels = dollar) +
+      labs(x = "Change in predicted annual revenue (applied largest effect first)", y = NULL, fill = NULL,
+           title = paste("From a typical site", fmt_dollar(d$baseline), "to the prediction", fmt_dollar(d$prediction))) +
+      theme_minimal() + theme(legend.position = "bottom")
+  })
+  output$drv_table <- renderDT({
+    d <- drivers(); validate(need(isTRUE(d$available), d$message))
+    bind_rows(
+      tibble(Step = "Typical site", Multiplier = NA_real_, `Dollar change` = NA_real_, `Running total` = d$baseline),
+      d$table %>% transmute(Step = Driver, Multiplier, `Dollar change` = Dollar_Change, `Running total` = Running_Total)) %>%
+      datatable(rownames = FALSE, selection = "none", options = list(dom = "t", ordering = FALSE, scrollX = TRUE)) %>%
+      formatRound("Multiplier", 2) %>% formatCurrency(c("Dollar change", "Running total"), "$", digits = 0)
+  })
+
+  # Model example sites
+  output$sanity_check <- renderUI({
+    x <- influence(); r <- scoring_result()
+    if (!isTRUE(x$available)) return(NULL)
+    div(class = "sanity-line", tags$strong("Sanity check: "),
+        paste0("the ", nrow(x$top), " existing sites the model sees as most similar earn a median of ",
+               fmt_dollar(x$top_median_revenue), " vs the ", fmt_dollar(r$predicted_revenue), " prediction; ",
+               sum(x$top$In_Matched_25), " of them ", if (sum(x$top$In_Matched_25) == 1) "is" else "are",
+               " also in your matched data centers."))
+  })
+  output$infl_table <- renderDT({
+    x <- influence(); r <- scoring_result(); pp <- proposed_perf()
+    validate(need(isTRUE(x$available), x$message))
+    inp <- r$input
+    bind_rows(
+      tibble(Rank = "Proposed", GLM_ID = inp$GLM_ID[[1]], Operator = "", Location = paste(inp$city[[1]], inp$state[[1]], sep = ", "),
+             Segment = inp$DC_Segments[[1]], `Bill year` = "Proposed", Sqft = inp$SQ_foot[[1]], Power = inp$Capacity[[1]], `Urban / Rural` = inp$urban_rural[[1]],
+             `Annual Revenue` = r$predicted_revenue, `Revenue / sqft` = pp$rev_per_sqft,
+             `Model similarity` = NA_real_, `Why similar` = "", `In your matches` = "", Class = paste0(ifelse(is.na(pp$tier), "—", pp$tier), " (predicted)")),
+      x$top %>% transmute(Rank = as.character(Influence_Rank), GLM_ID, Operator = DC_Operator,
+                          Location = paste(city, state, sep = ", "), Segment = DC_Segments, `Bill year` = bill_year_text(Bill_Year), Sqft = SQ_foot,
+                          Power = Capacity, `Urban / Rural` = urban_rural, `Annual Revenue` = Revenue,
+                          `Revenue / sqft` = Rev_per_SQFT, `Model similarity` = Model_Similarity,
+                          `Why similar` = Why_Similar, `In your matches` = ifelse(In_Matched_25, "Yes", "No"),
+                          Class = as.character(Tier))) %>%
+      datatable(rownames = FALSE, selection = "none", options = list(dom = "t", ordering = FALSE, scrollX = TRUE, pageLength = 50)) %>%
+      formatCurrency("Annual Revenue", "$", digits = 0) %>% formatCurrency("Revenue / sqft", "$", digits = 2) %>%
+      formatRound(c("Sqft", "Power"), 0) %>% formatPercentage("Model similarity", 1) %>%
+      formatStyle("Rank", target = "row", fontWeight = styleEqual("Proposed", "700"), backgroundColor = styleEqual("Proposed", "#e8f1fb"))
   })
 }
 
