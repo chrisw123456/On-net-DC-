@@ -1,4 +1,5 @@
 # On-Net Data Center Characteristics, Customer Data and Model
+# Version 17.11-ridge.1 — browser upload is required; source-policy-safe Excel readers replace all local fallbacks.
 # Version 17.11-ridge — Shinylive/browser-compatible ridge model replaces the prior boosted-tree model while retaining
 #             the same target, predictors, training-set option, CV metrics, model explanation, and rankings.
 # Version 17.11 — model training set option: all eligible GLMs (default) or only GLMs first billed in/after a
@@ -88,7 +89,6 @@ set.seed(123)
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-default_file_path <- "OnNetDC_Modeling (2) (2).xlsx"
 default_sheet_name <- "main"
 target_column <- "Total_MRR_12M"
 id_column <- "GLM_ID"
@@ -101,9 +101,7 @@ capex_column <- "CAPEX"
 historical_tam_column <- "TAM_(2030)"
 quote_text_column <- "BandwidthQuoting_Last12Months_(>= 10G)"
 revenue_window <- "Aug 2025-Jul 2026"
-# Order data (comparison only). Separate optional upload in the sidebar; if none is chosen, the file
-# below in the app folder is used when "Load order data" is clicked.
-default_order_file_path <- "DC_Order_Data_Analysis.xlsx"
+# Order data (comparison only). It is loaded only from the optional browser upload.
 default_order_sheet_name <- "Data"
 order_required_columns <- c("DC_GLM_ID", "SALES_RPT_PERIOD_DATE", "MRR_NET_SALES")
 valid_segments <- as.character(1:5)
@@ -668,7 +666,15 @@ load_order_months <- function(path, sheet = default_order_sheet_name, file_name 
     if (!sheet %in% sheets) {
       if (length(sheets) == 1) sheet <- sheets[[1]] else stop("Order sheet '", sheet, "' not found. Sheets: ", paste(sheets, collapse = ", "))
     }
-    tryCatch(read_excel(path, sheet = sheet, guess_max = 50000), error = function(e) stop(describe_unreadable_excel(path), call. = FALSE))
+    tryCatch({
+      if (identical(ext, "xlsx")) {
+        read_xlsx(path, sheet = sheet, guess_max = 50000)
+      } else if (identical(ext, "xls")) {
+        read_xls(path, sheet = sheet, guess_max = 50000)
+      } else {
+        stop("Order data must be an .xlsx, .xls, or .csv file.")
+      }
+    }, error = function(e) stop(describe_unreadable_excel(path), call. = FALSE))
   }
   missing <- setdiff(order_required_columns, names(raw))
   if (length(missing)) stop("Order data is missing required columns: ", paste(missing, collapse = ", "))
@@ -723,16 +729,27 @@ attach_order_activity <- function(sites, op) {
                                        Annual_Order_Rate / Total_MRR_12M, NA_real_))
 }
 
+read_uploaded_model_workbook <- function(file_path, file_name, sheet_name) {
+  extension <- tolower(tools::file_ext(file_name))
+  if (identical(extension, "xlsx")) {
+    read_xlsx(file_path, sheet = sheet_name, .name_repair = "minimal")
+  } else if (identical(extension, "xls")) {
+    read_xls(file_path, sheet = sheet_name, .name_repair = "minimal")
+  } else {
+    stop("The modeling workbook must be an .xlsx or .xls file.")
+  }
+}
+
 training_label <- function(t) {
   if (is.null(t) || t$mode == "all") "All eligible GLMs" else paste0("GLMs first billed ", t$year, " or later")
 }
 
-build_model_bundle <- function(file_path, sheet_name, progress_callback = NULL, training = list(mode = "all", year = 2019L)) {
+build_model_bundle <- function(file_path, file_name, sheet_name, progress_callback = NULL, training = list(mode = "all", year = 2019L)) {
   progress <- function(value, detail) {
     if (!is.null(progress_callback)) progress_callback(value, detail)
   }
   progress(0.03, "Reading on-net facility characteristics")
-  raw <- read_excel(file_path, sheet = sheet_name, .name_repair = "minimal")
+  raw <- read_uploaded_model_workbook(file_path, file_name, sheet_name)
   if (anyNA(names(raw)) || any(!nzchar(names(raw))) || anyDuplicated(names(raw))) {
     stop("Workbook columns must have nonempty, unique headers.")
   }
@@ -1583,7 +1600,7 @@ ui <- fluidPage(
       tags$aside(class = "sidebar-panel", `aria-label` = "Workbook and proposed-site inputs",
                  div(class = "sidebar-section",
                      h4(class = "sidebar-section-title", "01 / Workbook"),
-                     fileInput("model_file", "Modeling workbook", accept = c(".xlsx", ".xls"), placeholder = default_file_path),
+                     fileInput("model_file", "Modeling workbook", accept = c(".xlsx", ".xls"), placeholder = "Choose an Excel workbook"),
                      textInput("sheet_name", "Sheet", default_sheet_name),
                      selectInput("train_set", "Train model on",
                                  c("All eligible GLMs" = "all", "GLMs first billed in / after cutoff year" = "after"), "all"),
@@ -1593,7 +1610,7 @@ ui <- fluidPage(
                      actionButton("load_model", "Load workbook", class = "btn-primary"),
                      uiOutput("load_status"),
                      tags$hr(),
-                     fileInput("order_file", "Order data (optional)", accept = c(".xlsx", ".xls", ".csv"), placeholder = default_order_file_path),
+                     fileInput("order_file", "Order data (optional)", accept = c(".xlsx", ".xls", ".csv"), placeholder = "Choose an optional order file"),
                      textInput("order_sheet_name", "Order sheet", default_order_sheet_name),
                      actionButton("load_orders", "Load order data", class = "btn-default"),
                      uiOutput("order_status")),
@@ -1877,11 +1894,14 @@ server <- function(input, output, session) {
   order_data <- reactiveVal(NULL)
   order_note <- reactiveVal("Optional: upload the order extract for a new-order comparison on matched GLMs. Not used by the model.")
   observeEvent(input$load_orders, {
-    path <- if (!is.null(input$order_file)) input$order_file$datapath else default_order_file_path
-    name <- if (!is.null(input$order_file)) input$order_file$name else default_order_file_path
-    if (is.null(input$order_file) && !file.exists(path)) {
-      order_note(paste0("Choose an order file first (", default_order_file_path, " is not in the app folder).")); return()
+    if (is.null(input$order_file)) {
+      order_note("Choose an order file before loading.")
+      showNotification("Choose an order file before loading.", type = "warning")
+      return()
     }
+    req(input$order_file)
+    path <- input$order_file$datapath
+    name <- input$order_file$name
     order_note("Loading order data…")
     tryCatch({
       od <- withProgress(message = "Loading order data", value = 0.5, load_order_months(path, input$order_sheet_name, name))
@@ -1939,17 +1959,26 @@ server <- function(input, output, session) {
     if (is.null(msg)) NULL else p(class = if (changed) "sidebar-note warning" else "sidebar-note", msg)
   })
   observeEvent(input$load_model, {
-    path <- if (!is.null(input$model_file)) input$model_file$datapath else default_file_path
+    if (is.null(input$model_file)) {
+      load_message("Choose an Excel workbook before loading.")
+      model_message("Choose an Excel workbook before loading.")
+      showNotification("Choose an Excel workbook before loading.", type = "warning")
+      return()
+    }
+    req(input$model_file)
+    path <- input$model_file$datapath
+    file_name <- input$model_file$name
     model_bundle(NULL); scoring_result(NULL)
     updateSelectInput(session, "detail_glm", choices = character(), selected = character())
     load_message("Loading workbook…")
     model_message("Loading characteristics and secondary calculations…")
     tryCatch({
       bundle <- withProgress(message = "Loading on-net evidence", value = 0, {
-        build_model_bundle(path, input$sheet_name, function(value, detail) setProgress(value = value, detail = detail),
+        build_model_bundle(path, file_name, input$sheet_name,
+                           function(value, detail) setProgress(value = value, detail = detail),
                            training = current_training())
       })
-      bundle$workbook_label <- if (!is.null(input$model_file)) input$model_file$name else default_file_path
+      bundle$workbook_label <- file_name
       bundle$sheet_name <- input$sheet_name
       model_bundle(bundle)
       # Urban / rural choices come from the workbook so the proposed site always uses a value the
